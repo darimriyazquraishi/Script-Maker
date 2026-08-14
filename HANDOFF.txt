@@ -1,0 +1,25 @@
+SCRIPTMAKER ONE-TAP HANDOFF
+
+FIRST TIME:
+1. Double-click INSTALL.bat.
+2. Put llama-server.exe in the "llama" folder.
+3. Put the GGUF model in the "models" folder.
+4. Double-click START.bat.
+
+EVERY TIME AFTER:
+Double-click START.bat.
+
+The launcher automatically:
+- finds llama-server.exe
+- finds the GGUF
+- starts llama.cpp with GPU offloading
+- waits for the local server
+- launches ScriptMaker
+
+No terminal commands are needed.
+
+Recommended model:
+Qwen3-14B-Q4_K_M.gguf
+
+Default research mode is free/local-first and does not require an API key.
+Tavily is optional.

@@ -1,0 +1,4 @@
+ScriptMaker Optimized Research/Generation Build
+Performance architecture: single-slot + Flash Attention + compact writing context
+Default context: 16384
+Default script target: 2000 words/version

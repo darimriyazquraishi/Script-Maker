@@ -1,0 +1,16 @@
+If START.bat says llama-server.exe was not found even though it exists in:
+F:\ScriptMaker_OneTap_Handoff\llama\llama-server.exe
+
+Use this fixed START.bat from this package.
+
+The previous launcher could overwrite the detected llama-server path with a blank
+LLAMA_SERVER_EXE= setting from .env. This fixed version ignores blank settings.
+
+Expected layout:
+ScriptMaker_OneTap_Handoff\
+  START.bat
+  INSTALL.bat
+  llama\
+    llama-server.exe
+  models\
+    Qwen3-14B-Q4_K_M.gguf
