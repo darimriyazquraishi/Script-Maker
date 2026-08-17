@@ -430,7 +430,7 @@ MATERIAL:
 """.strip()
 
 
-def script_prompt(brief, style, target_words=700, target_minutes=5):
+def script_prompt(brief, style, target_words=1000, target_minutes=5):
     if style == "documentary":
         style_instructions = """
 Style:
@@ -466,7 +466,7 @@ Style:
 
 TARGET DURATION & LENGTH:
 - Target Video Duration: approximately {target_minutes} minutes
-- Approximate Word Count: ~{target_words} words (at typical spoken narration rate of ~140 words/minute)
+- Approximate Word Count: ~{target_words} words (based on dynamic spoken YouTube video pacing of ~200 words/minute)
 
 {style_instructions}
 

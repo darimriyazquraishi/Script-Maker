@@ -23,7 +23,7 @@ def generate(
     llama_url,
     progress=None,
     on_stream=None,
-    target_words=700,
+    target_words=1000,
     target_minutes=5,
 ):
     _emit(progress, f"[1/5] Collecting and reading {len(urls)} source URL(s)...")
