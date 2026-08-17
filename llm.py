@@ -4,7 +4,10 @@ import shutil
 import subprocess
 import sys
 import time
+import threading
+import re
 from pathlib import Path
+
 import requests
 
 
@@ -27,12 +30,10 @@ def find_llama_server_exe(custom_path=None):
     if custom_path and os.path.isfile(custom_path):
         return os.path.abspath(custom_path)
 
-    # 1. Priority: Bundled internal llama-server from PyInstaller _MEIPASS
     bundled = get_bundle_dir() / "llama" / "llama-server.exe"
     if bundled.exists() and bundled.is_file():
         return str(bundled.resolve())
 
-    # 2. Priority: Adjacent llama folder next to exe or in current workspace
     app_dir = get_app_dir()
     candidates = [
         app_dir / "llama" / "llama-server.exe",
@@ -50,7 +51,6 @@ def find_llama_server_exe(custom_path=None):
     return ""
 
 
-
 def find_default_gguf_model(custom_path=None):
     """Find default GGUF model file in models folder."""
     if custom_path and os.path.isfile(custom_path):
@@ -66,16 +66,32 @@ def find_default_gguf_model(custom_path=None):
     return ""
 
 
-import threading
-
-
 class LlamaServerProcess:
-    def __init__(self, exe_path: str, model_path: str, port: int = 8080, ngl: int = 99, context: int = 32768, log_callback=None):
+    """
+    Launch a single-user llama.cpp server tuned for ScriptMaker.
+
+    The application generates one request at a time, so multiple 32k server
+    slots waste VRAM. We intentionally use a single slot plus Flash Attention.
+    """
+
+    def __init__(
+        self,
+        exe_path: str,
+        model_path: str,
+        port: int = 8080,
+        ngl: int = 99,
+        context: int = 16384,
+        parallel: int = 1,
+        flash_attention: bool = True,
+        log_callback=None,
+    ):
         self.exe_path = exe_path
         self.model_path = model_path
         self.port = port
         self.ngl = ngl
         self.context = context
+        self.parallel = parallel
+        self.flash_attention = flash_attention
         self.log_callback = log_callback
         self.process = None
         self._reader_thread = None
@@ -101,9 +117,16 @@ class LlamaServerProcess:
             "-m", self.model_path,
             "-ngl", str(self.ngl),
             "-c", str(self.context),
+            "-np", str(self.parallel),
+            "-fa", "on" if self.flash_attention else "off",
             "--host", "127.0.0.1",
-            "--port", str(self.port)
+            "--port", str(self.port),
         ]
+
+        if self.log_callback:
+            self.log_callback(
+                f"[llama] Command: {' '.join(cmd)}"
+            )
 
         creation_flags = 0
         if sys.platform == "win32":
@@ -139,9 +162,9 @@ class LlamaServer:
     def __init__(self, base_url: str):
         self.base_url = base_url.rstrip("/")
 
-    def health(self):
+    def health(self, timeout=1.0):
         try:
-            r = requests.get(self.base_url + "/health", timeout=4)
+            r = requests.get(self.base_url + "/health", timeout=timeout)
             return r.ok
         except Exception:
             return False
@@ -149,7 +172,7 @@ class LlamaServer:
     def wait_until_ready(self, timeout_sec=90, progress_cb=None):
         start = time.time()
         while time.time() - start < timeout_sec:
-            if self.health():
+            if self.health(timeout=1.5):
                 return True
             if progress_cb:
                 elapsed = int(time.time() - start)
@@ -157,7 +180,15 @@ class LlamaServer:
             time.sleep(2)
         return False
 
-    def chat_stream(self, system: str, user: str, temperature=0.4, max_tokens=5000, on_token=None, on_progress=None):
+    def chat_stream(
+        self,
+        system: str,
+        user: str,
+        temperature=0.4,
+        max_tokens=6000,
+        on_token=None,
+        on_progress=None,
+    ):
         payload = {
             "model": "local-model",
             "messages": [
@@ -180,39 +211,110 @@ class LlamaServer:
         collected = []
         token_count = 0
         last_progress_time = time.time()
+        finish_reason = None
 
         for line in r.iter_lines():
             if not line:
                 continue
             line_str = line.decode("utf-8", errors="replace")
-            if line_str.startswith("data: "):
-                data_str = line_str[6:].strip()
-                if data_str == "[DONE]":
-                    break
-                try:
-                    chunk = json.loads(data_str)
-                    choices = chunk.get("choices", [])
-                    if choices:
-                        delta = choices[0].get("delta", {})
-                        content = delta.get("content", "")
-                        if content:
-                            collected.append(content)
-                            token_count += 1
-                            if on_token:
-                                on_token(content)
-                            if on_progress and (time.time() - last_progress_time > 1.0 or token_count % 25 == 0):
-                                on_progress(f"Generated {token_count} tokens...")
-                                last_progress_time = time.time()
-                except Exception:
-                    pass
+            if not line_str.startswith("data: "):
+                continue
 
-        return "".join(collected)
+            data_str = line_str[6:].strip()
+            if data_str == "[DONE]":
+                break
 
-    def chat(self, system: str, user: str, temperature=0.4, max_tokens=5000, on_token=None, on_progress=None):
+            try:
+                chunk = json.loads(data_str)
+                choices = chunk.get("choices", [])
+                if not choices:
+                    continue
+                delta = choices[0].get("delta", {})
+                content = delta.get("content", "")
+                if choices[0].get("finish_reason"):
+                    finish_reason = choices[0].get("finish_reason")
+                if content:
+                    collected.append(content)
+                    token_count += 1
+                    if on_token:
+                        on_token(content)
+                    if on_progress and (time.time() - last_progress_time > 1.0 or token_count % 30 == 0):
+                        on_progress(f"Generated {token_count} tokens...")
+                        last_progress_time = time.time()
+            except Exception:
+                pass
+
+        full_text = "".join(collected)
+
+        # If generation was forcefully stopped by token limit before finishing,
+        # perform an auto-continuation to guarantee a complete script ending.
+        if finish_reason == "length" and token_count >= max_tokens - 10:
+            if on_progress:
+                on_progress("Auto-completing remaining script ending...")
+            continuation = self._continue_completion(system, user, full_text, on_token=on_token)
+            if continuation:
+                full_text += "\n" + continuation
+
+        return full_text
+
+    def _continue_completion(self, system: str, user: str, generated_text: str, on_token=None):
+        """Seamlessly continue generation if token limit was reached prematurely."""
         try:
-            return self.chat_stream(system, user, temperature, max_tokens, on_token=on_token, on_progress=on_progress)
+            last_context = generated_text[-1200:]
+            continuation_prompt = (
+                f"You were writing the script below, but reached the token limit before concluding:\n\n"
+                f"...[Previous text]...\n{last_context}\n\n"
+                f"CONTINUATION TASK: Seamlessly continue and finish the remaining points and write the final Conclusion and Outro call-to-action. "
+                f"Do not repeat previous text. Finish the script completely."
+            )
+            payload = {
+                "model": "local-model",
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                    {"role": "assistant", "content": generated_text},
+                    {"role": "user", "content": "Please write the conclusion and wrap up the script now."},
+                ],
+                "temperature": 0.4,
+                "max_tokens": 2000,
+                "stream": True,
+            }
+            r = requests.post(self.base_url + "/v1/chat/completions", json=payload, timeout=300, stream=True)
+            if not r.ok:
+                return ""
+            extra_tokens = []
+            for line in r.iter_lines():
+                if not line:
+                    continue
+                line_str = line.decode("utf-8", errors="replace")
+                if line_str.startswith("data: "):
+                    d_str = line_str[6:].strip()
+                    if d_str == "[DONE]":
+                        break
+                    try:
+                        c_json = json.loads(d_str)
+                        c_text = c_json.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                        if c_text:
+                            extra_tokens.append(c_text)
+                            if on_token:
+                                on_token(c_text)
+                    except Exception:
+                        pass
+            return "".join(extra_tokens)
         except Exception:
-            # Fallback to non-streaming if stream fails
+            return ""
+
+    def chat(self, system: str, user: str, temperature=0.4, max_tokens=6000, on_token=None, on_progress=None):
+        try:
+            return self.chat_stream(
+                system,
+                user,
+                temperature,
+                max_tokens,
+                on_token=on_token,
+                on_progress=on_progress,
+            )
+        except Exception:
             payload = {
                 "model": "local-model",
                 "messages": [
@@ -232,46 +334,57 @@ class LlamaServer:
             return data["choices"][0]["message"]["content"]
 
 
-
 SYSTEM_PROMPT = """
-You are a research-grounded content writer.
+You are ScriptMaker, a research-grounded long-form YouTube writer.
 
-Rules:
-- Use only facts present in the supplied research material.
-- Never invent names, dates, quotes, events, statistics, or sources.
-- When sources conflict, explicitly describe the uncertainty.
-- Prefer official/primary material when it exists.
-- Do not present an unverified claim as confirmed.
-- Distinguish between source reporting and confirmed facts.
-- Write naturally for a human audience.
-- You may improve structure and phrasing, but must not add unsupported facts.
+NON-NEGOTIABLE FACT RULES:
+- Use only facts supported by the supplied research brief.
+- Never invent names, dates, quotes, events, statistics, release information, or sources.
+- Treat conflicts as conflicts; do not silently choose a side.
+- Distinguish confirmed facts from reported or uncertain information.
+- Do not pad the script with generic trivia that is absent from the brief.
+
+WRITING RULES:
+- Write for spoken narration, not an essay.
+- Use varied sentence length and natural transitions.
+- Avoid repetitive "This show..." / "Another reason..." patterns.
+- Give each item enough development to feel worthwhile.
+- Prioritize specificity, context, and storytelling.
 """.strip()
 
 
-def _material_from_sources(sources, web_results):
-    material = []
+def _trim(text, limit):
+    text = text or ""
+    return text[:limit].strip()
 
-    for source in sources:
-        if source.get("content"):
+
+def _material_from_sources(sources, web_results):
+    """Build a bounded research input so the model never receives huge raw dumps."""
+    material = []
+    max_sources = 6
+
+    for source in sources[:max_sources]:
+        content = _trim(source.get("content"), 4000)
+        if content:
             material.append(
                 f"SOURCE: {source.get('title')}\n"
                 f"TYPE: {source.get('source_type')}\n"
                 f"URL: {source.get('url')}\n"
-                f"CONTENT:\n{source.get('content', '')[:9000]}"
+                f"CONTENT:\n{content}"
             )
 
-    for item in web_results:
-        content = (
+    for item in web_results[:max_sources]:
+        content = _trim(
             item.get("extracted_content")
             or item.get("raw_content")
-            or item.get("content")
-            or ""
+            or item.get("content"),
+            2500,
         )
         if content:
             material.append(
                 f"SEARCH RESULT: {item.get('title')}\n"
                 f"URL: {item.get('url')}\n"
-                f"CONTENT:\n{content[:7000]}"
+                f"CONTENT:\n{content}"
             )
 
     return "\n\n---\n\n".join(material)
@@ -283,67 +396,93 @@ def research_brief_prompt(topic, sources, web_results):
     return f"""
 Topic: {topic}
 
-Create a research brief in JSON with exactly these keys:
+Create a compact, high-value research brief for a future YouTube writer.
+Return JSON with exactly these keys:
 summary
 key_facts
 timeline
 people
 conflicts
 unknowns
+content_plan
+
+`content_plan` must be an array of objects. Each object should contain:
+- title
+- angle
+- key_facts (3-6 concise, evidence-grounded bullets)
+- source_urls (the URLs that support this item)
+
+For list/count topics, create exactly the requested number of items when the
+sources support that count. Example: if the topic says "10 shows", create 10
+content_plan objects. Do not invent missing items; use unknowns when evidence
+is insufficient.
 
 Rules:
-- All list values must be arrays of strings.
-- Keep every claim grounded in the supplied material.
-- Put unresolved contradictions in conflicts.
+- All list values must be arrays.
+- Keep claims grounded in the supplied material.
+- Put contradictions in conflicts.
 - Put missing or weakly supported information in unknowns.
-- Do not invent details merely to make the brief complete.
+- Do not copy whole articles.
+- Prefer concise facts over long prose.
 
 MATERIAL:
 {material}
 """.strip()
 
 
-def script_prompt(brief, style):
+def script_prompt(brief, style, target_words=700, target_minutes=5):
     if style == "documentary":
         style_instructions = """
 Style:
-- documentary and factual
-- calm, clear narration
-- chronological when helpful
-- informative rather than exaggerated
-- explain context before conclusions
+- Documentary and investigative tone
+- Calm, authoritative, engaging spoken narration
+- Deep context, historical background, and nuanced analysis
+- Smooth, natural transitions between chapters
 """
     else:
         style_instructions = """
 Style:
-- high-retention YouTube
-- strong opening hook
-- conversational narration
-- short paragraphs
-- curiosity-driven transitions
-- build toward the most interesting confirmed details
-- avoid unsupported clickbait
+- High-retention YouTube storytelling
+- Immediate punchy opening hook
+- Conversational, rhythmic spoken narration
+- Curiosity-driven transitions that pull the viewer forward
+- High-energy payoffs and actionable takeaways
+- Formatted visual directions as [B-ROLL: ...] where helpful
 """
 
-    return f"""
-Create a complete YouTube script from the research brief below.
+    content_plan = brief.get("content_plan", [])
+    compact_brief = {
+        "topic": brief.get("topic", ""),
+        "summary": brief.get("summary", ""),
+        "key_facts": brief.get("key_facts", []),
+        "timeline": brief.get("timeline", []),
+        "people": brief.get("people", []),
+        "conflicts": brief.get("conflicts", []),
+        "unknowns": brief.get("unknowns", []),
+        "content_plan": content_plan,
+    }
+
+    return f"""Write a COMPLETE, production-ready script based ONLY on the research brief below.
+
+TARGET DURATION & LENGTH:
+- Target Video Duration: approximately {target_minutes} minutes
+- Approximate Word Count: ~{target_words} words (at typical spoken narration rate of ~140 words/minute)
 
 {style_instructions}
 
-Structure:
-1. Hook
-2. Introduction
-3. Main story
-4. Important context
-5. Latest/most relevant confirmed information
-6. Conclusion
+SCRIPT STRUCTURE REQUIREMENTS:
+1. [Hook] (10-15% of length): Gripping opening statement that hooks the viewer instantly.
+2. [Introduction] (10-15% of length): Frame the subject, stakes, and why this matters.
+3. [Main Body] (60-70% of length): Cover the main points and content_plan thoroughly with substance, context, and storytelling.
+4. [Conclusion & Outro] (10% of length): Memorable wrap-up, final insight, and YouTube call-to-action.
 
-Do not invent anything that is not supported by the brief.
-When a fact is uncertain, clearly phrase it as uncertain.
-
-At the end, include a short "Sources to verify" section listing the URLs
-represented by the research material.
+CRITICAL COMPLETION RULES:
+- You MUST write the ENTIRE script from Hook to Conclusion/Outro.
+- Budget your words across the sections so the script finishes with a complete Conclusion within the target duration.
+- NEVER stop abruptly or end mid-sentence.
+- Do NOT include source bibliographies inside narration text.
+- Do NOT repeat the video title in every sentence.
 
 RESEARCH BRIEF:
-{json.dumps(brief, ensure_ascii=False, indent=2)}
+{json.dumps(compact_brief, ensure_ascii=False, indent=2)}
 """.strip()

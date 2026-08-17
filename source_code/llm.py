@@ -5,6 +5,7 @@ import subprocess
 import sys
 import time
 import threading
+import re
 from pathlib import Path
 
 import requests
@@ -161,9 +162,9 @@ class LlamaServer:
     def __init__(self, base_url: str):
         self.base_url = base_url.rstrip("/")
 
-    def health(self):
+    def health(self, timeout=1.0):
         try:
-            r = requests.get(self.base_url + "/health", timeout=4)
+            r = requests.get(self.base_url + "/health", timeout=timeout)
             return r.ok
         except Exception:
             return False
@@ -171,7 +172,7 @@ class LlamaServer:
     def wait_until_ready(self, timeout_sec=90, progress_cb=None):
         start = time.time()
         while time.time() - start < timeout_sec:
-            if self.health():
+            if self.health(timeout=1.5):
                 return True
             if progress_cb:
                 elapsed = int(time.time() - start)
@@ -184,7 +185,7 @@ class LlamaServer:
         system: str,
         user: str,
         temperature=0.4,
-        max_tokens=5000,
+        max_tokens=6000,
         on_token=None,
         on_progress=None,
     ):
@@ -210,6 +211,7 @@ class LlamaServer:
         collected = []
         token_count = 0
         last_progress_time = time.time()
+        finish_reason = None
 
         for line in r.iter_lines():
             if not line:
@@ -229,20 +231,80 @@ class LlamaServer:
                     continue
                 delta = choices[0].get("delta", {})
                 content = delta.get("content", "")
+                if choices[0].get("finish_reason"):
+                    finish_reason = choices[0].get("finish_reason")
                 if content:
                     collected.append(content)
                     token_count += 1
                     if on_token:
                         on_token(content)
-                    if on_progress and (time.time() - last_progress_time > 1.0 or token_count % 25 == 0):
+                    if on_progress and (time.time() - last_progress_time > 1.0 or token_count % 30 == 0):
                         on_progress(f"Generated {token_count} tokens...")
                         last_progress_time = time.time()
             except Exception:
                 pass
 
-        return "".join(collected)
+        full_text = "".join(collected)
 
-    def chat(self, system: str, user: str, temperature=0.4, max_tokens=5000, on_token=None, on_progress=None):
+        # If generation was forcefully stopped by token limit before finishing,
+        # perform an auto-continuation to guarantee a complete script ending.
+        if finish_reason == "length" and token_count >= max_tokens - 10:
+            if on_progress:
+                on_progress("Auto-completing remaining script ending...")
+            continuation = self._continue_completion(system, user, full_text, on_token=on_token)
+            if continuation:
+                full_text += "\n" + continuation
+
+        return full_text
+
+    def _continue_completion(self, system: str, user: str, generated_text: str, on_token=None):
+        """Seamlessly continue generation if token limit was reached prematurely."""
+        try:
+            last_context = generated_text[-1200:]
+            continuation_prompt = (
+                f"You were writing the script below, but reached the token limit before concluding:\n\n"
+                f"...[Previous text]...\n{last_context}\n\n"
+                f"CONTINUATION TASK: Seamlessly continue and finish the remaining points and write the final Conclusion and Outro call-to-action. "
+                f"Do not repeat previous text. Finish the script completely."
+            )
+            payload = {
+                "model": "local-model",
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                    {"role": "assistant", "content": generated_text},
+                    {"role": "user", "content": "Please write the conclusion and wrap up the script now."},
+                ],
+                "temperature": 0.4,
+                "max_tokens": 2000,
+                "stream": True,
+            }
+            r = requests.post(self.base_url + "/v1/chat/completions", json=payload, timeout=300, stream=True)
+            if not r.ok:
+                return ""
+            extra_tokens = []
+            for line in r.iter_lines():
+                if not line:
+                    continue
+                line_str = line.decode("utf-8", errors="replace")
+                if line_str.startswith("data: "):
+                    d_str = line_str[6:].strip()
+                    if d_str == "[DONE]":
+                        break
+                    try:
+                        c_json = json.loads(d_str)
+                        c_text = c_json.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                        if c_text:
+                            extra_tokens.append(c_text)
+                            if on_token:
+                                on_token(c_text)
+                    except Exception:
+                        pass
+            return "".join(extra_tokens)
+        except Exception:
+            return ""
+
+    def chat(self, system: str, user: str, temperature=0.4, max_tokens=6000, on_token=None, on_progress=None):
         try:
             return self.chat_stream(
                 system,
@@ -368,25 +430,24 @@ MATERIAL:
 """.strip()
 
 
-def script_prompt(brief, style, target_words=2200):
+def script_prompt(brief, style, target_words=700, target_minutes=5):
     if style == "documentary":
         style_instructions = """
 Style:
-- documentary and factual
-- calm, confident narration
-- strong context and historical framing
-- cinematic but restrained
-- natural transitions between sections
+- Documentary and investigative tone
+- Calm, authoritative, engaging spoken narration
+- Deep context, historical background, and nuanced analysis
+- Smooth, natural transitions between chapters
 """
     else:
         style_instructions = """
 Style:
-- high-retention YouTube documentary
-- immediate hook
-- conversational spoken narration
-- curiosity-driven transitions without fake suspense
-- strong payoffs and specific details
-- varied rhythm and sentence length
+- High-retention YouTube storytelling
+- Immediate punchy opening hook
+- Conversational, rhythmic spoken narration
+- Curiosity-driven transitions that pull the viewer forward
+- High-energy payoffs and actionable takeaways
+- Formatted visual directions as [B-ROLL: ...] where helpful
 """
 
     content_plan = brief.get("content_plan", [])
@@ -401,28 +462,26 @@ Style:
         "content_plan": content_plan,
     }
 
-    return f"""
-Write a complete long-form YouTube script based ONLY on the compact research brief below.
+    return f"""Write a COMPLETE, production-ready script based ONLY on the research brief below.
 
-TARGET LENGTH: approximately {target_words} words.
-Do not stop early. Stay near the target length while keeping the writing useful.
+TARGET DURATION & LENGTH:
+- Target Video Duration: approximately {target_minutes} minutes
+- Approximate Word Count: ~{target_words} words (at typical spoken narration rate of ~140 words/minute)
 
 {style_instructions}
 
-SCRIPT REQUIREMENTS:
-- Begin with a 100-150 word hook that creates a strong reason to keep watching.
-- Follow with a concise introduction that frames the topic.
-- Cover every content_plan item in order.
-- Give each major item substantial development instead of one-sentence summaries.
-- Explain WHY each item matters, not only what it is.
-- Use smooth transitions so the script feels like one story.
-- Add context from the research brief where it strengthens the narrative.
-- Mention uncertainty or source conflicts naturally when relevant.
-- End with a satisfying conclusion and a natural YouTube call to action.
-- Do NOT include a sources bibliography inside the narration; the application already stores sources separately.
-- Do NOT include visual directions, camera directions, or bracketed stage directions unless explicitly requested.
-- Do NOT use empty filler such as "but that's not all" repeatedly.
-- Do NOT repeat the title of the video in every section.
+SCRIPT STRUCTURE REQUIREMENTS:
+1. [Hook] (10-15% of length): Gripping opening statement that hooks the viewer instantly.
+2. [Introduction] (10-15% of length): Frame the subject, stakes, and why this matters.
+3. [Main Body] (60-70% of length): Cover the main points and content_plan thoroughly with substance, context, and storytelling.
+4. [Conclusion & Outro] (10% of length): Memorable wrap-up, final insight, and YouTube call-to-action.
+
+CRITICAL COMPLETION RULES:
+- You MUST write the ENTIRE script from Hook to Conclusion/Outro.
+- Budget your words across the sections so the script finishes with a complete Conclusion within the target duration.
+- NEVER stop abruptly or end mid-sentence.
+- Do NOT include source bibliographies inside narration text.
+- Do NOT repeat the video title in every sentence.
 
 RESEARCH BRIEF:
 {json.dumps(compact_brief, ensure_ascii=False, indent=2)}

@@ -2,6 +2,7 @@ import json
 import os
 import sys
 import time
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -88,7 +89,7 @@ class ServerWaitThread(QThread):
         llama = LlamaServer(self.llama_url)
         start = time.time()
         while time.time() - start < self.timeout_sec:
-            if llama.health():
+            if llama.health(timeout=1.5):
                 self.ready.emit(True)
                 return
             elapsed = int(time.time() - start)
@@ -103,7 +104,7 @@ class Worker(QThread):
     finished_ok = Signal(dict)
     failed = Signal(str)
 
-    def __init__(self, urls, topic, mode, tavily_key, llama_url, llama_exe, gguf_model, ngl, context, target_words, server_proc_ref, log_callback=None):
+    def __init__(self, urls, topic, mode, tavily_key, llama_url, llama_exe, gguf_model, ngl, context, target_words, target_minutes, server_proc_ref, log_callback=None):
         super().__init__()
         self.urls = urls
         self.topic = topic
@@ -115,13 +116,14 @@ class Worker(QThread):
         self.ngl = ngl
         self.context = context
         self.target_words = target_words
+        self.target_minutes = target_minutes
         self.server_proc_ref = server_proc_ref
         self.log_callback = log_callback
 
     def run(self):
         try:
             llama = LlamaServer(self.llama_url)
-            if not llama.health():
+            if not llama.health(timeout=1.5):
                 if not self.gguf_model or not os.path.isfile(self.gguf_model):
                     raise RuntimeError(
                         f"llama-server is not running at {self.llama_url} and no valid GGUF model file was selected.\n\n"
@@ -169,6 +171,7 @@ class Worker(QThread):
                 progress=self.progress.emit,
                 on_stream=self.stream_token.emit,
                 target_words=self.target_words,
+                target_minutes=self.target_minutes,
             )
             self.finished_ok.emit(result)
         except Exception as exc:
@@ -189,6 +192,13 @@ class MainWindow(QMainWindow):
         self.worker = None
         self.wait_thread = None
         self.server_proc_ref = [None]
+
+        # Smooth token streaming buffer to prevent UI locking
+        self.token_buffer = {"brief": [], "script_a": [], "script_b": []}
+        self.stream_timer = QTimer(self)
+        self.stream_timer.setInterval(35)
+        self.stream_timer.timeout.connect(self.flush_stream_buffer)
+        self.stream_timer.start()
 
         self.log_bridge = ServerLogBridge()
         self.log_bridge.log_message.connect(self.append_log)
@@ -302,7 +312,7 @@ class MainWindow(QMainWindow):
         root.addWidget(QLabel("Topic"))
         self.topic = QLineEdit(self.config.get("last_topic", ""))
         self.topic.setPlaceholderText(
-            "e.g. House of the Dragon Season 3 — latest release and production information"
+            "e.g. 10 Essential Sci-Fi TV Shows You Need To Watch Before You Die"
         )
         root.addWidget(self.topic)
 
@@ -316,7 +326,7 @@ class MainWindow(QMainWindow):
         self.urls.setMinimumHeight(110)
         root.addWidget(self.urls)
 
-        # Research Mode Form
+        # Research & Script Configuration Form
         form = QFormLayout()
 
         self.research_mode = QComboBox()
@@ -332,15 +342,51 @@ class MainWindow(QMainWindow):
 
         form.addRow("Research mode", self.research_mode)
 
-        self.script_length = QComboBox()
-        self.script_length.addItem("Short (~1400 words)", 1400)
-        self.script_length.addItem("Standard (~2000 words)", 2000)
-        self.script_length.addItem("Long (~2500 words)", 2500)
-        self.script_length.addItem("Very Long (~3200 words)", 3200)
-        saved_words = int(self.config.get("target_words", 2000))
-        closest = min(range(self.script_length.count()), key=lambda i: abs(int(self.script_length.itemData(i)) - saved_words))
-        self.script_length.setCurrentIndex(closest)
-        form.addRow("Script length", self.script_length)
+        # Target Video Duration & Word Count Selector
+        dur_layout = QHBoxLayout()
+        self.duration_combo = QComboBox()
+        self.duration_combo.addItem("3 Minutes (~420 words - Quick/Short Form)", (3, 420))
+        self.duration_combo.addItem("5 Minutes (~700 words - Standard YouTube)", (5, 700))
+        self.duration_combo.addItem("8 Minutes (~1,120 words - Mid-Length)", (8, 1120))
+        self.duration_combo.addItem("10 Minutes (~1,400 words - Deep Dive)", (10, 1400))
+        self.duration_combo.addItem("15 Minutes (~2,100 words - Long-Form Documentary)", (15, 2100))
+        self.duration_combo.addItem("20 Minutes (~2,800 words - Extended Video)", (20, 2800))
+        self.duration_combo.addItem("Custom Duration...", "custom")
+
+        self.custom_mins_input = QSpinBox()
+        self.custom_mins_input.setRange(1, 60)
+        self.custom_mins_input.setValue(self.config.get("target_minutes", 5))
+        self.custom_mins_input.setSuffix(" mins")
+        self.custom_mins_input.setFixedWidth(85)
+        self.custom_mins_input.hide()
+
+        self.custom_words_lbl = QLabel("(~700 words)")
+        self.custom_words_lbl.setStyleSheet("color: #666;")
+        self.custom_words_lbl.hide()
+
+        self.custom_mins_input.valueChanged.connect(self.on_custom_minutes_changed)
+        self.duration_combo.currentIndexChanged.connect(self.on_duration_combo_changed)
+
+        saved_mins = self.config.get("target_minutes", 5)
+        matched = False
+        for i in range(self.duration_combo.count()):
+            data = self.duration_combo.itemData(i)
+            if isinstance(data, tuple) and data[0] == saved_mins:
+                self.duration_combo.setCurrentIndex(i)
+                matched = True
+                break
+        if not matched:
+            self.duration_combo.setCurrentIndex(self.duration_combo.count() - 1)
+            self.custom_mins_input.setValue(saved_mins)
+            self.custom_mins_input.show()
+            self.custom_words_lbl.show()
+
+        dur_layout.addWidget(self.duration_combo)
+        dur_layout.addWidget(self.custom_mins_input)
+        dur_layout.addWidget(self.custom_words_lbl)
+        dur_layout.addStretch()
+
+        form.addRow("Target video length", dur_layout)
 
         self.tavily = QLineEdit(self.config.get("tavily_key") or os.getenv("TAVILY_API_KEY", ""))
         self.tavily.setEchoMode(QLineEdit.Password)
@@ -418,12 +464,35 @@ class MainWindow(QMainWindow):
 
         self.setCentralWidget(central)
 
-        # Health monitor timer
+        # Health monitor timer (Non-blocking)
         self.timer = QTimer(self)
-        self.timer.setInterval(3000)
+        self.timer.setInterval(4000)
         self.timer.timeout.connect(self.check_server_health)
         self.timer.start()
         self.check_server_health()
+
+    def on_duration_combo_changed(self):
+        data = self.duration_combo.currentData()
+        if data == "custom":
+            self.custom_mins_input.show()
+            self.custom_words_lbl.show()
+            self.on_custom_minutes_changed()
+        else:
+            self.custom_mins_input.hide()
+            self.custom_words_lbl.hide()
+
+    def on_custom_minutes_changed(self):
+        mins = self.custom_mins_input.value()
+        approx_words = int(mins * 140)
+        self.custom_words_lbl.setText(f"(~{approx_words} words)")
+
+    def get_target_duration_and_words(self):
+        data = self.duration_combo.currentData()
+        if isinstance(data, tuple):
+            return data[0], data[1]
+        mins = self.custom_mins_input.value()
+        words = int(mins * 140)
+        return mins, words
 
     def focus_logs_tab(self):
         self.tabs.setCurrentWidget(self.log_tab)
@@ -442,18 +511,27 @@ class MainWindow(QMainWindow):
         self.append_log(f"[{now}] {msg}")
 
     def on_stream_token(self, section: str, token: str):
-        if section == "brief":
-            self.research_view.moveCursor(QTextCursor.End)
-            self.research_view.insertPlainText(token)
-            self.research_view.ensureCursorVisible()
-        elif section == "script_a":
-            self.script_a.moveCursor(QTextCursor.End)
-            self.script_a.insertPlainText(token)
-            self.script_a.ensureCursorVisible()
-        elif section == "script_b":
-            self.script_b.moveCursor(QTextCursor.End)
-            self.script_b.insertPlainText(token)
-            self.script_b.ensureCursorVisible()
+        if section in self.token_buffer:
+            self.token_buffer[section].append(token)
+
+    def flush_stream_buffer(self):
+        for section, tokens in self.token_buffer.items():
+            if not tokens:
+                continue
+            chunk = "".join(tokens)
+            tokens.clear()
+            if section == "brief":
+                self.research_view.moveCursor(QTextCursor.End)
+                self.research_view.insertPlainText(chunk)
+                self.research_view.ensureCursorVisible()
+            elif section == "script_a":
+                self.script_a.moveCursor(QTextCursor.End)
+                self.script_a.insertPlainText(chunk)
+                self.script_a.ensureCursorVisible()
+            elif section == "script_b":
+                self.script_b.moveCursor(QTextCursor.End)
+                self.script_b.insertPlainText(chunk)
+                self.script_b.ensureCursorVisible()
 
     def browse_gguf_model(self):
         current = self.gguf_path_input.text().strip()
@@ -482,13 +560,15 @@ class MainWindow(QMainWindow):
             self.save_current_config()
 
     def save_current_config(self):
+        mins, words = self.get_target_duration_and_words()
         data = {
             "gguf_model_path": self.gguf_path_input.text().strip(),
             "llama_exe_path": self.exe_path_input.text().strip(),
             "llama_url": self.llama_url.text().strip(),
             "gpu_layers": self.ngl_input.value(),
             "context_size": self.ctx_input.value(),
-            "target_words": int(self.script_length.currentData()),
+            "target_minutes": mins,
+            "target_words": words,
             "research_mode": self.research_mode.currentData(),
             "tavily_key": self.tavily.text().strip(),
             "last_topic": self.topic.text().strip(),
@@ -496,9 +576,15 @@ class MainWindow(QMainWindow):
         save_config(data)
 
     def check_server_health(self):
+        # Do not perform blocking network calls if generation worker is running
+        if self.worker and self.worker.isRunning():
+            self.server_status_lbl.setText("🟢 Server Generating...")
+            self.server_status_lbl.setStyleSheet("font-weight: bold; color: #5cb85c; margin-left: 10px;")
+            return
+
         url = self.llama_url.text().strip()
         llama = LlamaServer(url)
-        if llama.health():
+        if llama.health(timeout=0.6):
             self.server_status_lbl.setText(f"🟢 Server Online ({url})")
             self.server_status_lbl.setStyleSheet("font-weight: bold; color: #5cb85c; margin-left: 10px;")
         else:
@@ -534,7 +620,7 @@ class MainWindow(QMainWindow):
         self.append_log(f"\n[{now}] [ScriptMaker] Launching local llama-server...")
         self.append_log(f"[{now}] [ScriptMaker] Binary: {exe}")
         self.append_log(f"[{now}] [ScriptMaker] Model:  {gguf}")
-        self.append_log(f"[{now}] [ScriptMaker] GPU layers: {self.ngl_input.value()} | Context: {self.ctx_input.value()} | Slots: 1 | Flash Attention: ON")
+        self.append_log(f"[{now}] [ScriptMaker] GPU offload layers (ngl): {self.ngl_input.value()} | Context: {self.ctx_input.value()}")
         self.append_log("-" * 65)
 
         try:
@@ -593,7 +679,7 @@ class MainWindow(QMainWindow):
         topic = self.topic.text().strip()
         urls = normalize_urls(self.urls.toPlainText())
         mode = self.research_mode.currentData()
-        target_words = int(self.script_length.currentData())
+        target_mins, target_words = self.get_target_duration_and_words()
 
         if not topic:
             QMessageBox.warning(self, "Missing topic", "Please enter a topic.")
@@ -615,7 +701,8 @@ class MainWindow(QMainWindow):
             )
             return
 
-        # Clear previous results and stream output
+        # Clear previous results and stream buffers
+        self.token_buffer = {"brief": [], "script_a": [], "script_b": []}
         self.research_view.clear()
         self.script_a.clear()
         self.script_b.clear()
@@ -627,9 +714,9 @@ class MainWindow(QMainWindow):
         now = datetime.now().strftime("%H:%M:%S")
         self.append_log(f"\n[{now}] [ScriptMaker] ===== STARTING RESEARCH & GENERATION =====")
         self.append_log(f"[{now}] [ScriptMaker] Topic: {topic}")
+        self.append_log(f"[{now}] [ScriptMaker] Target Duration: {target_mins} mins (~{target_words} words)")
         self.append_log(f"[{now}] [ScriptMaker] Sources count: {len(urls)}")
         self.append_log(f"[{now}] [ScriptMaker] Research Mode: {mode}")
-        self.append_log(f"[{now}] [ScriptMaker] Target script length: ~{target_words} words per version")
 
         self.worker = Worker(
             urls=urls,
@@ -642,6 +729,7 @@ class MainWindow(QMainWindow):
             ngl=self.ngl_input.value(),
             context=self.ctx_input.value(),
             target_words=target_words,
+            target_minutes=target_mins,
             server_proc_ref=self.server_proc_ref,
             log_callback=self.log_bridge.log_message.emit,
         )
@@ -653,6 +741,7 @@ class MainWindow(QMainWindow):
 
     def on_done(self, result):
         self.result = result
+        self.flush_stream_buffer()
         self.progress_bar.hide()
         self.generate_btn.setEnabled(True)
         self.status.setText("Completed.")
@@ -687,6 +776,7 @@ class MainWindow(QMainWindow):
         self.tabs.setCurrentIndex(1)
 
     def on_error(self, message):
+        self.flush_stream_buffer()
         self.progress_bar.hide()
         self.generate_btn.setEnabled(True)
         self.status.setText("Failed.")
@@ -714,11 +804,13 @@ class MainWindow(QMainWindow):
         if not path:
             return
 
+        mins, words = self.get_target_duration_and_words()
         payload = {
             "topic": self.topic.text().strip(),
             "source_urls": normalize_urls(self.urls.toPlainText()),
             "research_mode": self.research_mode.currentData(),
-            "target_words": int(self.script_length.currentData()),
+            "target_minutes": mins,
+            "target_words": words,
             **self.result,
         }
 
@@ -733,42 +825,63 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "Nothing to export",
-                "Generate scripts first.",
+                "Please generate scripts first before exporting.",
             )
             return
 
         folder = QFileDialog.getExistingDirectory(
             self,
-            "Choose output folder",
+            "Select Output Folder to Export Scripts",
         )
         if not folder:
             return
 
-        folder = Path(folder)
-        topic = (
-            self.topic.text().strip().replace("/", "-")
-            .replace("\\", "-")[:60]
-            or "script"
-        )
+        out_dir = Path(folder)
 
-        (folder / f"{topic}_documentary.md").write_text(
-            self.result["script_a"],
-            encoding="utf-8",
-        )
-        (folder / f"{topic}_youtube.md").write_text(
-            self.result["script_b"],
-            encoding="utf-8",
-        )
-        (folder / f"{topic}_research.json").write_text(
-            json.dumps(
-                self.result["brief"],
-                indent=2,
-                ensure_ascii=False,
-            ),
-            encoding="utf-8",
-        )
+        # Sanitize topic string for safe Windows filenames (remove : * ? " < > | / \)
+        raw_topic = self.topic.text().strip() or "script"
+        safe_topic = re.sub(r'[\\/*?:"<>|]', '_', raw_topic)
+        safe_topic = re.sub(r'\s+', ' ', safe_topic).strip()[:80]
+        if not safe_topic:
+            safe_topic = "script"
 
-        self.status.setText(f"Exported to: {folder}")
+        doc_file = out_dir / f"{safe_topic}_documentary.md"
+        yt_file = out_dir / f"{safe_topic}_youtube.md"
+        json_file = out_dir / f"{safe_topic}_research.json"
+
+        try:
+            doc_file.write_text(self.result.get("script_a", ""), encoding="utf-8")
+            yt_file.write_text(self.result.get("script_b", ""), encoding="utf-8")
+            json_file.write_text(
+                json.dumps(self.result.get("brief", {}), indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            self.status.setText(f"Exported to: {out_dir}")
+            now = datetime.now().strftime("%H:%M:%S")
+            self.append_log(f"[{now}] [ScriptMaker] Exported 3 files to {out_dir.resolve()}")
+
+            msg_box = QMessageBox(self)
+            msg_box.setWindowTitle("Export Successful")
+            msg_box.setIcon(QMessageBox.Information)
+            msg_box.setText(
+                f"Successfully exported scripts and research to:\n{out_dir}\n\n"
+                f"• {doc_file.name}\n"
+                f"• {yt_file.name}\n"
+                f"• {json_file.name}"
+            )
+            open_folder_btn = msg_box.addButton("Open Folder", QMessageBox.ActionRole)
+            msg_box.addButton(QMessageBox.Ok)
+            msg_box.exec()
+
+            if msg_box.clickedButton() == open_folder_btn:
+                try:
+                    os.startfile(str(out_dir))
+                except Exception:
+                    pass
+
+        except Exception as exc:
+            QMessageBox.critical(self, "Export Failed", f"Failed to write export files:\n{exc}")
 
     def closeEvent(self, event):
         self.save_current_config()

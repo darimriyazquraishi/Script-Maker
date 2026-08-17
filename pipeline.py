@@ -1,5 +1,4 @@
 import json
-import time
 
 from models import ResearchBrief
 from research import (
@@ -24,6 +23,8 @@ def generate(
     llama_url,
     progress=None,
     on_stream=None,
+    target_words=700,
+    target_minutes=5,
 ):
     _emit(progress, f"[1/5] Collecting and reading {len(urls)} source URL(s)...")
     sources = collect_sources(urls, progress=progress)
@@ -43,10 +44,11 @@ def generate(
             progress=progress,
         )
 
-        _emit(progress, f"[3/5] Reading content from {len(search_results)} search result pages...")
+        _emit(progress, f"[3/5] Reading content from {min(len(search_results), 6)} selected search result pages...")
         web_results = enrich_search_results(
             search_results,
             progress=progress,
+            max_pages=6,
         )
         _emit(progress, f"[Research] Extracted readable articles from {len(web_results)} web pages.")
 
@@ -56,15 +58,15 @@ def generate(
 
     llama = LlamaServer(llama_url)
 
-    if not llama.health():
+    if not llama.health(timeout=2.0):
         raise RuntimeError(
             f"llama-server is not reachable at {llama_url}.\n\n"
             "Please ensure the local AI server is started."
         )
 
     # 4. Generate structured research brief
-    _emit(progress, "[4/5] Generating structured research brief with local AI...")
-    
+    _emit(progress, "[4/5] Generating compact research brief with local AI...")
+
     def on_brief_token(tok):
         if on_stream:
             on_stream("brief", tok)
@@ -79,8 +81,8 @@ def generate(
             [s.to_dict() for s in sources],
             web_results,
         ),
-        temperature=0.2,
-        max_tokens=4500,
+        temperature=0.15,
+        max_tokens=3500,
         on_token=on_brief_token,
         on_progress=on_brief_progress,
     )
@@ -97,6 +99,7 @@ def generate(
             "people": [],
             "conflicts": [],
             "unknowns": [],
+            "content_plan": [],
         }
 
     brief = ResearchBrief(
@@ -107,6 +110,7 @@ def generate(
         people=brief_data.get("people", []),
         conflicts=brief_data.get("conflicts", []),
         unknowns=brief_data.get("unknowns", []),
+        content_plan=brief_data.get("content_plan", []),
         sources=[s.to_dict() for s in sources],
         evidence=[e.to_dict() for e in evidence],
     )
@@ -116,8 +120,22 @@ def generate(
             [f"Search warning: {error}" for error in search_errors[:10]]
         )
 
+    writing_brief = {
+        "topic": brief.topic,
+        "summary": brief.summary,
+        "key_facts": brief.key_facts,
+        "timeline": brief.timeline,
+        "people": brief.people,
+        "conflicts": brief.conflicts,
+        "unknowns": brief.unknowns,
+        "content_plan": brief.content_plan,
+    }
+
+    # Token headroom calculation: ~140 words/min, generous buffer to guarantee 100% complete ending
+    max_script_tokens = max(3000, min(8192, int(target_words * 2.2)))
+
     # 5. Writing scripts
-    _emit(progress, "[5/5] Writing Version A: Documentary Script (Streaming)...")
+    _emit(progress, f"[5/5] Writing Version A: Documentary Script (~{target_minutes} mins / ~{target_words} words)...")
 
     def on_script_a_token(tok):
         if on_stream:
@@ -128,14 +146,14 @@ def generate(
 
     script_a = llama.chat(
         SYSTEM_PROMPT,
-        script_prompt(brief.to_dict(), "documentary"),
+        script_prompt(writing_brief, "documentary", target_words=target_words, target_minutes=target_minutes),
         temperature=0.5,
-        max_tokens=7000,
+        max_tokens=max_script_tokens,
         on_token=on_script_a_token,
         on_progress=on_script_a_progress,
     )
 
-    _emit(progress, "[5/5] Writing Version B: High-Retention YouTube Script (Streaming)...")
+    _emit(progress, f"[5/5] Writing Version B: High-Retention YouTube Script (~{target_minutes} mins / ~{target_words} words)...")
 
     def on_script_b_token(tok):
         if on_stream:
@@ -146,9 +164,9 @@ def generate(
 
     script_b = llama.chat(
         SYSTEM_PROMPT,
-        script_prompt(brief.to_dict(), "youtube"),
+        script_prompt(writing_brief, "youtube", target_words=target_words, target_minutes=target_minutes),
         temperature=0.65,
-        max_tokens=7000,
+        max_tokens=max_script_tokens,
         on_token=on_script_b_token,
         on_progress=on_script_b_progress,
     )
@@ -161,4 +179,6 @@ def generate(
         "search_errors": search_errors,
         "script_a": script_a,
         "script_b": script_b,
+        "target_words": target_words,
+        "target_minutes": target_minutes,
     }
