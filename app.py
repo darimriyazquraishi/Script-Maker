@@ -32,9 +32,10 @@ from PySide6.QtWidgets import (
     QRadioButton,
     QButtonGroup,
     QCheckBox,
+    QScrollArea,
 )
 
-from pipeline import generate
+from pipeline import generate, estimate_topic_scope
 from research import normalize_urls
 from llm import (
     LlamaServer,
@@ -103,7 +104,6 @@ def write_docx_file(filepath: Path, title: str, content: str, topic: str, durati
 
         doc.add_paragraph("―" * 45)
 
-        # Content parsing
         for block in content.split("\n\n"):
             block = block.strip()
             if not block:
@@ -132,6 +132,139 @@ def write_docx_file(filepath: Path, title: str, content: str, topic: str, durati
         raise RuntimeError(f"Error writing DOCX file: {exc}")
 
 
+class GenerateOptionsDialog(QDialog):
+    """Pre-generation options dialog to choose which components to generate."""
+    def __init__(self, parent, target_mins: int, target_words: int):
+        super().__init__(parent)
+        self.setWindowTitle("Generation Options & Checklist")
+        self.resize(460, 310)
+
+        layout = QVBoxLayout(self)
+
+        info_lbl = QLabel(f"<b>Target Scope:</b> {target_mins} mins (~{target_words} words)")
+        layout.addWidget(info_lbl)
+
+        group = QGroupBox("Select What to Generate:")
+        grp_layout = QVBoxLayout(group)
+
+        self.chk_brief = QCheckBox("🌐 Web/YouTube Research & Structured Brief")
+        self.chk_brief.setChecked(True)
+        grp_layout.addWidget(self.chk_brief)
+
+        self.chk_yt = QCheckBox("🎬 Version B — High-Retention YouTube Script")
+        self.chk_yt.setChecked(True)
+        grp_layout.addWidget(self.chk_yt)
+
+        self.chk_doc = QCheckBox("📽️ Version A — Documentary Script")
+        self.chk_doc.setChecked(True)
+        grp_layout.addWidget(self.chk_doc)
+
+        self.chk_scope_alert = QCheckBox("🔍 Check topic scope & alert if research has many subtopics")
+        self.chk_scope_alert.setChecked(True)
+        grp_layout.addWidget(self.chk_scope_alert)
+
+        layout.addWidget(group)
+
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btn_layout.addWidget(cancel_btn)
+
+        self.start_btn = QPushButton("🚀 Start Generation")
+        self.start_btn.setStyleSheet("font-weight: bold; background-color: #1976d2; color: white; padding: 6px 16px;")
+        self.start_btn.clicked.connect(self.accept)
+        btn_layout.addWidget(self.start_btn)
+        layout.addLayout(btn_layout)
+
+
+class ScopeEstimateDialog(QDialog):
+    """Dialog alerting the user when research contains many items exceeding the target length."""
+    def __init__(self, parent, topic: str, item_count: int, cur_words: int, cur_mins: int, rec_words: int, rec_mins: int):
+        super().__init__(parent)
+        self.setWindowTitle("Topic Scope & Length Optimization")
+        self.resize(520, 360)
+
+        self.rec_words = rec_words
+        self.rec_mins = rec_mins
+        self.cur_words = cur_words
+        self.cur_mins = cur_mins
+
+        self.final_words = cur_words
+        self.final_mins = cur_mins
+
+        layout = QVBoxLayout(self)
+
+        header = QLabel("<h3>🔍 Dense Topic Detected!</h3>")
+        layout.addWidget(header)
+
+        desc = QLabel(
+            f"The research material contains <b>{item_count} distinct announcements/topics</b>.<br><br>"
+            f"• <b>Current Target:</b> {cur_mins} mins (~{cur_words} words) &rarr; <i>~{int(cur_words/item_count)} words/item (very compressed)</i><br>"
+            f"• <b>Recommended:</b> <b>{rec_mins} mins (~{rec_words} words)</b> &rarr; <i>~85 words/item for full coverage</i>"
+        )
+        desc.setWordWrap(True)
+        layout.addWidget(desc)
+
+        group = QGroupBox("Choose Writing Target:")
+        grp_layout = QVBoxLayout(group)
+
+        self.rad_rec = QRadioButton(f"✨ Auto-Adjust to Recommended: {rec_mins} mins (~{rec_words} words)")
+        self.rad_rec.setChecked(True)
+        grp_layout.addWidget(self.rad_rec)
+
+        self.rad_cur = QRadioButton(f"⚡ Keep Current Target: {cur_mins} mins (~{cur_words} words) [Ultra-concise summary]")
+        grp_layout.addWidget(self.rad_cur)
+
+        self.rad_custom = QRadioButton("⚙️ Specify Custom Duration:")
+        grp_layout.addWidget(self.rad_custom)
+
+        custom_row = QHBoxLayout()
+        self.spin_mins = QSpinBox()
+        self.spin_mins.setRange(1, 60)
+        self.spin_mins.setValue(rec_mins)
+        self.spin_mins.setSuffix(" mins")
+        self.spin_mins.setEnabled(False)
+        self.lbl_custom_words = QLabel(f"(~{rec_words} words)")
+        self.spin_mins.valueChanged.connect(self.on_spin_changed)
+        custom_row.addWidget(self.spin_mins)
+        custom_row.addWidget(self.lbl_custom_words)
+        custom_row.addStretch()
+        grp_layout.addLayout(custom_row)
+
+        self.rad_custom.toggled.connect(self.spin_mins.setEnabled)
+        layout.addWidget(group)
+
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btn_layout.addWidget(cancel_btn)
+
+        proceed_btn = QPushButton("Proceed with Writing")
+        proceed_btn.setStyleSheet("font-weight: bold; background-color: #2e7d32; color: white; padding: 6px 16px;")
+        proceed_btn.clicked.connect(self.on_proceed)
+        btn_layout.addWidget(proceed_btn)
+        layout.addLayout(btn_layout)
+
+    def on_spin_changed(self):
+        m = self.spin_mins.value()
+        w = m * 200
+        self.lbl_custom_words.setText(f"(~{w} words)")
+
+    def on_proceed(self):
+        if self.rad_rec.isChecked():
+            self.final_words = self.rec_words
+            self.final_mins = self.rec_mins
+        elif self.rad_cur.isChecked():
+            self.final_words = self.cur_words
+            self.final_mins = self.cur_mins
+        else:
+            self.final_mins = self.spin_mins.value()
+            self.final_words = self.final_mins * 200
+        self.accept()
+
+
 class ExportDialog(QDialog):
     def __init__(self, parent, default_topic: str, result_data: dict, duration_str: str):
         super().__init__(parent)
@@ -146,7 +279,6 @@ class ExportDialog(QDialog):
 
         layout = QVBoxLayout(self)
 
-        # Format Selection Group
         fmt_group = QGroupBox("Select Export Format:")
         fmt_layout = QVBoxLayout(fmt_group)
 
@@ -162,7 +294,6 @@ class ExportDialog(QDialog):
         fmt_layout.addWidget(self.radio_all)
         layout.addWidget(fmt_group)
 
-        # Included Items Group
         items_group = QGroupBox("Files to Include:")
         items_layout = QVBoxLayout(items_group)
         self.chk_doc = QCheckBox("Version A — Documentary Script")
@@ -176,7 +307,6 @@ class ExportDialog(QDialog):
         items_layout.addWidget(self.chk_json)
         layout.addWidget(items_group)
 
-        # Output Folder Picker
         fld_layout = QHBoxLayout()
         fld_layout.addWidget(QLabel("Output Folder:"))
         self.folder_input = QLineEdit(str(Path.home() / "Documents"))
@@ -186,7 +316,6 @@ class ExportDialog(QDialog):
         fld_layout.addWidget(browse_fld_btn)
         layout.addLayout(fld_layout)
 
-        # Buttons
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
         cancel_btn = QPushButton("Cancel")
@@ -225,7 +354,6 @@ class ExportDialog(QDialog):
         brief_data = self.result_data.get("brief", {})
 
         try:
-            # Documentary
             if self.chk_doc.isChecked() and script_a:
                 if is_docx:
                     p = folder / f"{topic_name}_documentary.docx"
@@ -240,7 +368,6 @@ class ExportDialog(QDialog):
                     p.write_text(f"# {topic_name} — Documentary Script\n\n> Target: {self.duration_str}\n\n{script_a}", encoding="utf-8")
                     exported.append(p.name)
 
-            # YouTube
             if self.chk_yt.isChecked() and script_b:
                 if is_docx:
                     p = folder / f"{topic_name}_youtube.docx"
@@ -255,7 +382,6 @@ class ExportDialog(QDialog):
                     p.write_text(f"# {topic_name} — YouTube Script\n\n> Target: {self.duration_str}\n\n{script_b}", encoding="utf-8")
                     exported.append(p.name)
 
-            # JSON Brief
             if self.chk_json.isChecked() and brief_data:
                 p = folder / f"{topic_name}_research.json"
                 p.write_text(json.dumps(brief_data, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -267,6 +393,179 @@ class ExportDialog(QDialog):
 
         except Exception as exc:
             QMessageBox.critical(self, "Export Error", f"Failed to export scripts:\n{exc}")
+
+
+class ChatWorker(QThread):
+    stream_token = Signal(str)
+    finished_ok = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, llama_url: str, messages: list):
+        super().__init__()
+        self.llama_url = llama_url
+        self.messages = messages
+
+    def run(self):
+        try:
+            llama = LlamaServer(self.llama_url)
+            full_response = llama.chat_conversation_stream(
+                messages=self.messages,
+                temperature=0.5,
+                max_tokens=4000,
+                on_token=self.stream_token.emit,
+            )
+            self.finished_ok.emit(full_response)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class AIChatDialog(QDialog):
+    """Interactive AI Assistant window for revising, refining, and conversing about the script."""
+    def __init__(self, parent, llama_url: str, topic: str, active_tab_title: str, active_text: str, brief_data: dict, apply_callback=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"💬 AI Script Assistant — {active_tab_title}")
+        self.resize(750, 620)
+        self.llama_url = llama_url
+        self.active_tab_title = active_tab_title
+        self.apply_callback = apply_callback
+        self.chat_worker = None
+
+        self.messages = []
+        system_context = (
+            f"You are ScriptMaker's AI Scriptwriting Assistant.\n"
+            f"TOPIC: {topic}\n"
+            f"ACTIVE WORKING DRAFT ({active_tab_title}):\n{active_text[:6000]}\n\n"
+            f"INSTRUCTION: Help the user refine, expand, condense, polish, or modify this script as requested. "
+            f"Keep facts grounded in the topic. Write clearly for spoken video narration."
+        )
+        self.messages.append({"role": "system", "content": system_context})
+
+        layout = QVBoxLayout(self)
+
+        # Quick Action Chips
+        chips_layout = QHBoxLayout()
+        chips_layout.addWidget(QLabel("<b>Quick Actions:</b>"))
+        actions = [
+            ("⚡ Hook Polish", "Rewrite the opening Hook to be significantly punchier and higher-retention."),
+            ("🎥 Add Visual Cues", "Add descriptive [B-ROLL: ...] visual and editing cues throughout the script."),
+            ("✂️ Condense Script", "Condense this script while retaining all key announcements/points."),
+            ("🔥 Punchier Tone", "Make the narrative voice faster-paced and more engaging for YouTube."),
+        ]
+        for label, prompt in actions:
+            btn = QPushButton(label)
+            btn.setStyleSheet("padding: 3px 8px; font-size: 11px;")
+            btn.clicked.connect(lambda _, p=prompt: self.send_prompt(p))
+            chips_layout.addWidget(btn)
+        chips_layout.addStretch()
+        layout.addLayout(chips_layout)
+
+        # Chat History View
+        self.chat_history = QPlainTextEdit()
+        self.chat_history.setReadOnly(True)
+        self.chat_history.setStyleSheet(
+            "QPlainTextEdit { background-color: #1e1e1e; color: #f0f0f0; font-size: 13px; font-family: 'Segoe UI', sans-serif; line-height: 1.4; border-radius: 6px; padding: 8px; }"
+        )
+        layout.addWidget(self.chat_history)
+
+        self.append_system_msg(f"👋 Script Assistant ready for <b>{active_tab_title}</b>. Ask for edits, rewrites, or section enhancements!")
+
+        # User Input Box
+        input_layout = QHBoxLayout()
+        self.input_field = QPlainTextEdit()
+        self.input_field.setPlaceholderText("Type your instruction (e.g., 'Make section 2 more detailed with Marvel facts')...")
+        self.input_field.setMaximumHeight(70)
+        self.input_field.setStyleSheet("font-size: 13px;")
+        input_layout.addWidget(self.input_field)
+
+        self.send_btn = QPushButton("Send ↵")
+        self.send_btn.setStyleSheet("font-weight: bold; background-color: #1976d2; color: white; padding: 12px 18px;")
+        self.send_btn.clicked.connect(self.send_user_message)
+        input_layout.addWidget(self.send_btn)
+        layout.addLayout(input_layout)
+
+        # Bottom Controls
+        bottom_layout = QHBoxLayout()
+        clear_btn = QPushButton("Clear Chat")
+        clear_btn.clicked.connect(self.clear_chat)
+        bottom_layout.addWidget(clear_btn)
+
+        bottom_layout.addStretch()
+
+        self.copy_btn = QPushButton("📋 Copy Last Response")
+        self.copy_btn.clicked.connect(self.copy_last_response)
+        bottom_layout.addWidget(self.copy_btn)
+
+        self.apply_btn = QPushButton("✨ Apply / Replace in Active Tab")
+        self.apply_btn.setStyleSheet("font-weight: bold; background-color: #2e7d32; color: white; padding: 6px 14px;")
+        self.apply_btn.clicked.connect(self.apply_to_tab)
+        bottom_layout.addWidget(self.apply_btn)
+
+        layout.addLayout(bottom_layout)
+
+        self.last_assistant_response = ""
+
+    def append_system_msg(self, text: str):
+        self.chat_history.appendHtml(f"<div style='color: #888; margin-bottom: 8px;'><i>{text}</i></div>")
+
+    def append_user_msg(self, text: str):
+        self.chat_history.appendHtml(f"<div style='color: #64b5f6; font-weight: bold; margin-top: 10px;'>👤 You:</div><div style='margin-bottom: 10px; color: #fff;'>{text}</div>")
+
+    def send_prompt(self, prompt: str):
+        self.input_field.setPlainText(prompt)
+        self.send_user_message()
+
+    def send_user_message(self):
+        text = self.input_field.toPlainText().strip()
+        if not text:
+            return
+
+        self.input_field.clear()
+        self.append_user_msg(text)
+        self.messages.append({"role": "user", "content": text})
+
+        self.chat_history.appendHtml(f"<div style='color: #81c784; font-weight: bold; margin-top: 8px;'>🤖 AI Assistant:</div>")
+        self.send_btn.setEnabled(False)
+        self.last_assistant_response = ""
+
+        self.chat_worker = ChatWorker(self.llama_url, self.messages)
+        self.chat_worker.stream_token.connect(self.on_chat_token)
+        self.chat_worker.finished_ok.connect(self.on_chat_done)
+        self.chat_worker.failed.connect(self.on_chat_error)
+        self.chat_worker.start()
+
+    def on_chat_token(self, token: str):
+        self.last_assistant_response += token
+        self.chat_history.moveCursor(QTextCursor.End)
+        self.chat_history.insertPlainText(token)
+        self.chat_history.ensureCursorVisible()
+
+    def on_chat_done(self, full_text: str):
+        self.last_assistant_response = full_text
+        self.messages.append({"role": "assistant", "content": full_text})
+        self.chat_history.appendPlainText("\n")
+        self.send_btn.setEnabled(True)
+
+    def on_chat_error(self, err: str):
+        self.chat_history.appendHtml(f"<div style='color: #e57373;'><b>Error:</b> {err}</div>")
+        self.send_btn.setEnabled(True)
+
+    def copy_last_response(self):
+        if self.last_assistant_response:
+            QApplication.clipboard().setText(self.last_assistant_response)
+            QMessageBox.information(self, "Copied", "AI response copied to clipboard!")
+
+    def apply_to_tab(self):
+        if not self.last_assistant_response:
+            QMessageBox.warning(self, "Nothing to apply", "Generate a response first.")
+            return
+        if self.apply_callback:
+            self.apply_callback(self.last_assistant_response)
+            QMessageBox.information(self, "Applied", f"Response applied to '{self.active_tab_title}' tab!")
+
+    def clear_chat(self):
+        self.chat_history.clear()
+        self.messages = [self.messages[0]]
+        self.append_system_msg("Chat reset. Ready for new instructions.")
 
 
 class ServerLogBridge(QObject):
@@ -297,11 +596,12 @@ class ServerWaitThread(QThread):
 
 class Worker(QThread):
     progress = Signal(str)
-    stream_token = Signal(str, str)  # section, token
+    stream_token = Signal(str, str)
     finished_ok = Signal(dict)
     failed = Signal(str)
+    scope_check_needed = Signal(dict, int, int)  # brief_dict, current_words, current_minutes
 
-    def __init__(self, urls, topic, mode, tavily_key, llama_url, llama_exe, gguf_model, ngl, context, target_words, target_minutes, server_proc_ref, log_callback=None):
+    def __init__(self, urls, topic, mode, tavily_key, llama_url, llama_exe, gguf_model, ngl, context, target_words, target_minutes, do_brief, do_youtube, do_doc, check_scope, server_proc_ref, log_callback=None):
         super().__init__()
         self.urls = urls
         self.topic = topic
@@ -314,6 +614,10 @@ class Worker(QThread):
         self.context = context
         self.target_words = target_words
         self.target_minutes = target_minutes
+        self.do_brief = do_brief
+        self.do_youtube = do_youtube
+        self.do_doc = do_doc
+        self.check_scope = check_scope
         self.server_proc_ref = server_proc_ref
         self.log_callback = log_callback
 
@@ -354,10 +658,10 @@ class Worker(QThread):
                 if not ready:
                     raise RuntimeError(
                         "llama-server process started but failed to become ready within 90 seconds.\n"
-                        "Check the 'Activity & Server Logs' panel for details."
+                        "Check the console logs for details."
                     )
                 if self.log_callback:
-                    self.log_callback("[ScriptMaker] Server is ready! Starting research and script generation...")
+                    self.log_callback("[ScriptMaker] Server is ready! Starting research...")
 
             result = generate(
                 self.urls,
@@ -369,6 +673,9 @@ class Worker(QThread):
                 on_stream=self.stream_token.emit,
                 target_words=self.target_words,
                 target_minutes=self.target_minutes,
+                do_brief=self.do_brief,
+                do_youtube=self.do_youtube,
+                do_documentary=self.do_doc,
             )
             self.finished_ok.emit(result)
         except Exception as exc:
@@ -390,7 +697,7 @@ class MainWindow(QMainWindow):
         self.wait_thread = None
         self.server_proc_ref = [None]
 
-        # Smooth token streaming buffer to prevent UI locking
+        # Smooth token streaming buffer
         self.token_buffer = {"brief": [], "script_a": [], "script_b": []}
         self.stream_timer = QTimer(self)
         self.stream_timer.setInterval(35)
@@ -425,7 +732,7 @@ class MainWindow(QMainWindow):
         title = QLabel("<h2 style='margin:0; padding:0;'>ScriptMaker Studio</h2>")
         title_vbox.addWidget(title)
         title_vbox.addWidget(
-            QLabel("Autonomous Web/YouTube Research & Local GGUF Script Generation")
+            QLabel("Autonomous Multi-Source Research & Grounded Local Script Generation")
         )
         header_layout.addLayout(title_vbox)
         header_layout.addStretch()
@@ -508,12 +815,12 @@ class MainWindow(QMainWindow):
         # Topic & URLs
         left_layout.addWidget(QLabel("<b>Topic Objective:</b>"))
         self.topic = QLineEdit(self.config.get("last_topic", ""))
-        self.topic.setPlaceholderText("e.g. 10 Essential Sci-Fi TV Shows You Need To Watch Before You Die")
+        self.topic.setPlaceholderText("e.g. Disney D23 2026 Showcase Announcements & Reveals")
         left_layout.addWidget(self.topic)
 
         left_layout.addWidget(QLabel("<b>Research Source URLs (Articles, YouTube Videos — one per line):</b>"))
         self.urls = QPlainTextEdit()
-        self.urls.setPlaceholderText("https://example.com/article\nhttps://youtube.com/watch?v=...")
+        self.urls.setPlaceholderText("https://screenrant.com/...\nhttps://youtube.com/watch?v=...")
         self.urls.setMaximumHeight(85)
         left_layout.addWidget(self.urls)
 
@@ -592,7 +899,7 @@ class MainWindow(QMainWindow):
             "QPushButton { font-weight: bold; background-color: #1976d2; color: white; padding: 8px 16px; font-size: 13px; }"
             "QPushButton:hover { background-color: #1565c0; }"
         )
-        self.generate_btn.clicked.connect(self.start_generation)
+        self.generate_btn.clicked.connect(self.on_click_generate)
         actions.addWidget(self.generate_btn)
 
         save_btn = QPushButton("Save Project")
@@ -641,6 +948,15 @@ class MainWindow(QMainWindow):
         right_header.addWidget(QLabel("<h3 style='margin:0;'>Script Studio & Live Generation</h3>"))
         right_header.addStretch()
 
+        # Chatbot Assistant Button
+        self.chat_btn = QPushButton("💬 Chat with AI (Assistant)")
+        self.chat_btn.setStyleSheet(
+            "QPushButton { font-weight: bold; background-color: #7b1fa2; color: white; padding: 4px 10px; }"
+            "QPushButton:hover { background-color: #6a1b9a; }"
+        )
+        self.chat_btn.clicked.connect(self.open_ai_chat)
+        right_header.addWidget(self.chat_btn)
+
         copy_btn = QPushButton("Copy Active Script")
         copy_btn.clicked.connect(self.copy_active_tab)
         right_header.addWidget(copy_btn)
@@ -650,12 +966,12 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
 
         self.script_b = QPlainTextEdit()
-        self.script_b.setReadOnly(True)
+        self.script_b.setReadOnly(False)  # Editable for live writer tweaks
         self.script_b.setStyleSheet("font-size: 13px; line-height: 1.4;")
         self.tabs.addTab(self.script_b, "🎬 Version B — YouTube")
 
         self.script_a = QPlainTextEdit()
-        self.script_a.setReadOnly(True)
+        self.script_a.setReadOnly(False)  # Editable
         self.script_a.setStyleSheet("font-size: 13px; line-height: 1.4;")
         self.tabs.addTab(self.script_a, "📽️ Version A — Documentary")
 
@@ -671,10 +987,9 @@ class MainWindow(QMainWindow):
 
         right_layout.addWidget(self.tabs)
 
-        # Add panes to splitter
         self.splitter.addWidget(left_widget)
         self.splitter.addWidget(self.right_widget)
-        self.splitter.setSizes([580, 780])
+        self.splitter.setSizes([540, 840])
 
         self.setCentralWidget(self.splitter)
 
@@ -717,6 +1032,29 @@ class MainWindow(QMainWindow):
                 self.status.setText("Copied active script to clipboard!")
             else:
                 self.status.setText("Nothing to copy in active tab.")
+
+    def open_ai_chat(self):
+        current_tab_idx = self.tabs.currentIndex()
+        tab_titles = ["Version B — YouTube", "Version A — Documentary", "Research Brief", "Sources & Evidence"]
+        title = tab_titles[current_tab_idx] if current_tab_idx < len(tab_titles) else "Script"
+
+        current_widget = self.tabs.currentWidget()
+        active_text = current_widget.toPlainText() if isinstance(current_widget, QPlainTextEdit) else ""
+
+        def apply_text_to_tab(new_text):
+            if isinstance(current_widget, QPlainTextEdit):
+                current_widget.setPlainText(new_text)
+
+        dialog = AIChatDialog(
+            parent=self,
+            llama_url=self.llama_url.text().strip(),
+            topic=self.topic.text().strip() or "Untitled",
+            active_tab_title=title,
+            active_text=active_text,
+            brief_data=self.result.get("brief", {}) if self.result else {},
+            apply_callback=apply_text_to_tab,
+        )
+        dialog.exec()
 
     def clear_logs(self):
         self.log_view.clear()
@@ -889,9 +1227,7 @@ class MainWindow(QMainWindow):
         else:
             QMessageBox.information(self, "Info", "No server process managed by ScriptMaker is currently running.")
 
-    def start_generation(self):
-        self.save_current_config()
-
+    def on_click_generate(self):
         topic = self.topic.text().strip()
         urls = normalize_urls(self.urls.toPlainText())
         mode = self.research_mode.currentData()
@@ -917,26 +1253,57 @@ class MainWindow(QMainWindow):
             )
             return
 
-        # Clear previous results and stream buffers
-        self.token_buffer = {"brief": [], "script_a": [], "script_b": []}
-        self.research_view.clear()
-        self.script_a.clear()
-        self.script_b.clear()
-        self.sources_view.clear()
+        # Pre-generation options dialog
+        opt_dialog = GenerateOptionsDialog(self, target_mins, target_words)
+        if opt_dialog.exec() != QDialog.Accepted:
+            return
 
-        # Expand / focus the side studio panel
-        self.splitter.setSizes([520, 860])
-        self.tabs.setCurrentIndex(0)
+        do_brief = opt_dialog.chk_brief.isChecked()
+        do_yt = opt_dialog.chk_yt.isChecked()
+        do_doc = opt_dialog.chk_doc.isChecked()
+        check_scope = opt_dialog.chk_scope_alert.isChecked()
+
+        if not do_brief and not do_yt and not do_doc:
+            QMessageBox.warning(self, "Nothing Selected", "Please select at least one component to generate.")
+            return
+
+        self.start_generation(do_brief, do_yt, do_doc, check_scope, target_words, target_mins)
+
+    def start_generation(self, do_brief, do_yt, do_doc, check_scope, target_words, target_mins):
+        self.save_current_config()
+
+        topic = self.topic.text().strip()
+        urls = normalize_urls(self.urls.toPlainText())
+        mode = self.research_mode.currentData()
+
+        # Clear active stream buffers
+        self.token_buffer = {"brief": [], "script_a": [], "script_b": []}
+        if do_brief:
+            self.research_view.clear()
+            self.sources_view.clear()
+        if do_doc:
+            self.script_a.clear()
+        if do_yt:
+            self.script_b.clear()
+
+        # Focus script studio
+        self.splitter.setSizes([500, 880])
+        if do_yt:
+            self.tabs.setCurrentIndex(0)
+        elif do_doc:
+            self.tabs.setCurrentIndex(1)
+        else:
+            self.tabs.setCurrentIndex(2)
 
         self.generate_btn.setEnabled(False)
         self.progress_bar.show()
 
         now = datetime.now().strftime("%H:%M:%S")
-        self.append_log(f"\n[{now}] [ScriptMaker] ===== STARTING RESEARCH & GENERATION =====")
+        self.append_log(f"\n[{now}] [ScriptMaker] ===== STARTING PIPELINE =====")
         self.append_log(f"[{now}] [ScriptMaker] Topic: {topic}")
-        self.append_log(f"[{now}] [ScriptMaker] Target Length: {target_mins} mins (~{target_words} words)")
+        self.append_log(f"[{now}] [ScriptMaker] Target Duration: {target_mins} mins (~{target_words} words)")
+        self.append_log(f"[{now}] [ScriptMaker] Components: Brief={do_brief} | YouTube={do_yt} | Documentary={do_doc}")
         self.append_log(f"[{now}] [ScriptMaker] Sources count: {len(urls)}")
-        self.append_log(f"[{now}] [ScriptMaker] Research Mode: {mode}")
 
         self.worker = Worker(
             urls=urls,
@@ -950,6 +1317,10 @@ class MainWindow(QMainWindow):
             context=self.ctx_input.value(),
             target_words=target_words,
             target_minutes=target_mins,
+            do_brief=do_brief,
+            do_youtube=do_yt,
+            do_doc=do_doc,
+            check_scope=check_scope,
             server_proc_ref=self.server_proc_ref,
             log_callback=self.log_bridge.log_message.emit,
         )
@@ -967,12 +1338,16 @@ class MainWindow(QMainWindow):
         self.status.setText("Completed.")
         self.check_server_health()
 
-        brief = result["brief"]
-        self.research_view.setPlainText(
-            json.dumps(brief, indent=2, ensure_ascii=False)
-        )
-        self.script_a.setPlainText(result["script_a"])
-        self.script_b.setPlainText(result["script_b"])
+        brief = result.get("brief", {})
+        if brief:
+            self.research_view.setPlainText(
+                json.dumps(brief, indent=2, ensure_ascii=False)
+            )
+
+        if result.get("script_a"):
+            self.script_a.setPlainText(result["script_a"])
+        if result.get("script_b"):
+            self.script_b.setPlainText(result["script_b"])
 
         sources_text = []
         for source in brief.get("sources", []):
@@ -989,11 +1364,18 @@ class MainWindow(QMainWindow):
                 f"{result_item.get('url')}\n"
             )
 
-        self.sources_view.setPlainText("\n---\n".join(sources_text))
+        if sources_text:
+            self.sources_view.setPlainText("\n---\n".join(sources_text))
         
         now = datetime.now().strftime("%H:%M:%S")
-        self.append_log(f"[{now}] [ScriptMaker SUCCESS] Research and scripts generated successfully!")
-        self.tabs.setCurrentIndex(0)  # Focus YouTube tab
+        self.append_log(f"[{now}] [ScriptMaker SUCCESS] Generation tasks finished successfully!")
+        
+        if result.get("script_b"):
+            self.tabs.setCurrentIndex(0)
+        elif result.get("script_a"):
+            self.tabs.setCurrentIndex(1)
+        else:
+            self.tabs.setCurrentIndex(2)
 
     def on_error(self, message):
         self.flush_stream_buffer()

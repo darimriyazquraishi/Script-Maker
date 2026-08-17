@@ -180,6 +180,58 @@ class LlamaServer:
             time.sleep(2)
         return False
 
+    def chat_conversation_stream(
+        self,
+        messages: list,
+        temperature=0.5,
+        max_tokens=4000,
+        on_token=None,
+    ):
+        """Streaming multi-turn conversation with local LLM."""
+        payload = {
+            "model": "local-model",
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": True,
+        }
+
+        r = requests.post(
+            self.base_url + "/v1/chat/completions",
+            json=payload,
+            timeout=900,
+            stream=True,
+        )
+        r.raise_for_status()
+
+        collected = []
+        for line in r.iter_lines():
+            if not line:
+                continue
+            line_str = line.decode("utf-8", errors="replace")
+            if not line_str.startswith("data: "):
+                continue
+
+            data_str = line_str[6:].strip()
+            if data_str == "[DONE]":
+                break
+
+            try:
+                chunk = json.loads(data_str)
+                choices = chunk.get("choices", [])
+                if not choices:
+                    continue
+                delta = choices[0].get("delta", {})
+                content = delta.get("content", "")
+                if content:
+                    collected.append(content)
+                    if on_token:
+                        on_token(content)
+            except Exception:
+                pass
+
+        return "".join(collected)
+
     def chat_stream(
         self,
         system: str,
@@ -260,13 +312,6 @@ class LlamaServer:
     def _continue_completion(self, system: str, user: str, generated_text: str, on_token=None):
         """Seamlessly continue generation if token limit was reached prematurely."""
         try:
-            last_context = generated_text[-1200:]
-            continuation_prompt = (
-                f"You were writing the script below, but reached the token limit before concluding:\n\n"
-                f"...[Previous text]...\n{last_context}\n\n"
-                f"CONTINUATION TASK: Seamlessly continue and finish the remaining points and write the final Conclusion and Outro call-to-action. "
-                f"Do not repeat previous text. Finish the script completely."
-            )
             payload = {
                 "model": "local-model",
                 "messages": [
@@ -359,12 +404,13 @@ def _trim(text, limit):
 
 
 def _material_from_sources(sources, web_results):
-    """Build a bounded research input so the model never receives huge raw dumps."""
+    """Build a comprehensive research input so large multi-item articles are not truncated."""
     material = []
-    max_sources = 6
+    max_sources = 8
 
     for source in sources[:max_sources]:
-        content = _trim(source.get("content"), 4000)
+        # Generous per-source character limit (up to ~25,000 chars / ~4,000 words per article)
+        content = _trim(source.get("content"), 25000)
         if content:
             material.append(
                 f"SOURCE: {source.get('title')}\n"
@@ -378,7 +424,7 @@ def _material_from_sources(sources, web_results):
             item.get("extracted_content")
             or item.get("raw_content")
             or item.get("content"),
-            2500,
+            8000,
         )
         if content:
             material.append(
@@ -396,7 +442,7 @@ def research_brief_prompt(topic, sources, web_results):
     return f"""
 Topic: {topic}
 
-Create a compact, high-value research brief for a future YouTube writer.
+Create a structured, highly comprehensive research brief for a YouTube video script.
 Return JSON with exactly these keys:
 summary
 key_facts
@@ -407,22 +453,22 @@ unknowns
 content_plan
 
 `content_plan` must be an array of objects. Each object should contain:
-- title
-- angle
-- key_facts (3-6 concise, evidence-grounded bullets)
-- source_urls (the URLs that support this item)
+- title (The name of the announcement, movie, show, item, or topic)
+- angle (The significance, key revelation, or unique storyline)
+- key_facts (2-5 concise, evidence-grounded facts/bullets)
+- source_urls (array of supporting URLs)
 
-For list/count topics, create exactly the requested number of items when the
-sources support that count. Example: if the topic says "10 shows", create 10
-content_plan objects. Do not invent missing items; use unknowns when evidence
-is insufficient.
+CRITICAL EXHAUSTIVE COVERAGE INSTRUCTION:
+- You MUST capture EVERY distinct announcement, movie, show, project, character reveal, or item mentioned in the supplied material.
+- If the article contains 10, 15, 23, or more announcements, your `content_plan` MUST contain an entry for EVERY single one of them.
+- Do NOT stop after 5 or 6 items. Be thorough and complete.
+- For listicle/countdown articles (e.g. "Top 10", "23 Reveals"), create an item for each entry in the list.
 
 Rules:
 - All list values must be arrays.
 - Keep claims grounded in the supplied material.
 - Put contradictions in conflicts.
 - Put missing or weakly supported information in unknowns.
-- Do not copy whole articles.
 - Prefer concise facts over long prose.
 
 MATERIAL:
@@ -451,6 +497,7 @@ Style:
 """
 
     content_plan = brief.get("content_plan", [])
+    item_count = len(content_plan)
     compact_brief = {
         "topic": brief.get("topic", ""),
         "summary": brief.get("summary", ""),
@@ -473,12 +520,12 @@ TARGET DURATION & LENGTH:
 SCRIPT STRUCTURE REQUIREMENTS:
 1. [Hook] (10-15% of length): Gripping opening statement that hooks the viewer instantly.
 2. [Introduction] (10-15% of length): Frame the subject, stakes, and why this matters.
-3. [Main Body] (60-70% of length): Cover the main points and content_plan thoroughly with substance, context, and storytelling.
+3. [Main Body] (60-70% of length): Cover ALL {item_count} items from the content_plan in order. Balance the word count so every item receives meaningful attention without exceeding the pacing budget.
 4. [Conclusion & Outro] (10% of length): Memorable wrap-up, final insight, and YouTube call-to-action.
 
 CRITICAL COMPLETION RULES:
-- You MUST write the ENTIRE script from Hook to Conclusion/Outro.
-- Budget your words across the sections so the script finishes with a complete Conclusion within the target duration.
+- You MUST write the ENTIRE script covering ALL items from Hook to Conclusion/Outro.
+- Budget your words across all {item_count} sections so the script finishes with a complete Conclusion within the target duration.
 - NEVER stop abruptly or end mid-sentence.
 - Do NOT include source bibliographies inside narration text.
 - Do NOT repeat the video title in every sentence.
