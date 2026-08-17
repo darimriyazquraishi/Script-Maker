@@ -69,9 +69,6 @@ def find_default_gguf_model(custom_path=None):
 class LlamaServerProcess:
     """
     Launch a single-user llama.cpp server tuned for ScriptMaker.
-
-    The application generates one request at a time, so multiple 32k server
-    slots waste VRAM. We intentionally use a single slot plus Flash Attention.
     """
 
     def __init__(
@@ -196,13 +193,21 @@ class LlamaServer:
             "stream": True,
         }
 
-        r = requests.post(
-            self.base_url + "/v1/chat/completions",
-            json=payload,
-            timeout=900,
-            stream=True,
-        )
-        r.raise_for_status()
+        try:
+            r = requests.post(
+                self.base_url + "/v1/chat/completions",
+                json=payload,
+                timeout=900,
+                stream=True,
+            )
+            r.raise_for_status()
+        except requests.exceptions.HTTPError as err:
+            err_text = ""
+            try:
+                err_text = r.text
+            except Exception:
+                pass
+            raise RuntimeError(f"llama-server error: {err_text or err}")
 
         collected = []
         for line in r.iter_lines():
@@ -240,6 +245,7 @@ class LlamaServer:
         max_tokens=6000,
         on_token=None,
         on_progress=None,
+        _retry_count=0,
     ):
         payload = {
             "model": "local-model",
@@ -252,13 +258,35 @@ class LlamaServer:
             "stream": True,
         }
 
-        r = requests.post(
-            self.base_url + "/v1/chat/completions",
-            json=payload,
-            timeout=900,
-            stream=True,
-        )
-        r.raise_for_status()
+        try:
+            r = requests.post(
+                self.base_url + "/v1/chat/completions",
+                json=payload,
+                timeout=900,
+                stream=True,
+            )
+            r.raise_for_status()
+        except requests.exceptions.HTTPError as err:
+            err_text = ""
+            try:
+                err_text = r.text
+            except Exception:
+                pass
+            # Handle prompt exceeding context size automatically
+            if _retry_count == 0 and ("exceeds the available context size" in err_text or "context size" in err_text.lower()):
+                if on_progress:
+                    on_progress("Prompt exceeded context window; auto-compacting input and retrying...")
+                trimmed_user = user[:int(len(user) * 0.60)]
+                return self.chat_stream(
+                    system,
+                    trimmed_user,
+                    temperature=temperature,
+                    max_tokens=min(max_tokens, 3500),
+                    on_token=on_token,
+                    on_progress=on_progress,
+                    _retry_count=1,
+                )
+            raise RuntimeError(f"llama-server error: {err_text or err}")
 
         collected = []
         token_count = 0
@@ -298,8 +326,7 @@ class LlamaServer:
 
         full_text = "".join(collected)
 
-        # If generation was forcefully stopped by token limit before finishing,
-        # perform an auto-continuation to guarantee a complete script ending.
+        # Auto-continuation if cut off due to length
         if finish_reason == "length" and token_count >= max_tokens - 10:
             if on_progress:
                 on_progress("Auto-completing remaining script ending...")
@@ -350,33 +377,14 @@ class LlamaServer:
             return ""
 
     def chat(self, system: str, user: str, temperature=0.4, max_tokens=6000, on_token=None, on_progress=None):
-        try:
-            return self.chat_stream(
-                system,
-                user,
-                temperature,
-                max_tokens,
-                on_token=on_token,
-                on_progress=on_progress,
-            )
-        except Exception:
-            payload = {
-                "model": "local-model",
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-                "temperature": temperature,
-                "max_tokens": max_tokens,
-            }
-            r = requests.post(
-                self.base_url + "/v1/chat/completions",
-                json=payload,
-                timeout=900,
-            )
-            r.raise_for_status()
-            data = r.json()
-            return data["choices"][0]["message"]["content"]
+        return self.chat_stream(
+            system,
+            user,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            on_token=on_token,
+            on_progress=on_progress,
+        )
 
 
 SYSTEM_PROMPT = """
@@ -403,46 +411,71 @@ def _trim(text, limit):
     return text[:limit].strip()
 
 
-def _material_from_sources(sources, web_results):
-    """Build a comprehensive research input so large multi-item articles are not truncated."""
+def _material_from_sources(sources, web_results, max_total_chars=30000):
+    """
+    Intelligently budget source and search text so it never exceeds 16k context.
+    Prioritizes user-provided sources (75% budget) and distributes the rest to web search results.
+    """
     material = []
-    max_sources = 8
+    if not sources and not web_results:
+        return ""
 
-    for source in sources[:max_sources]:
-        # Generous per-source character limit (up to ~25,000 chars / ~4,000 words per article)
-        content = _trim(source.get("content"), 25000)
+    # Allocate 75% to direct user sources (e.g. up to 22,500 chars) and 25% to search enrichments
+    source_budget = int(max_total_chars * 0.75) if web_results else max_total_chars
+    search_budget = max_total_chars - source_budget
+
+    per_source_limit = max(5000, source_budget // max(1, min(len(sources), 3)))
+    total_source_chars = 0
+
+    for source in sources[:6]:
+        remaining = source_budget - total_source_chars
+        if remaining <= 500:
+            break
+        limit = min(per_source_limit, remaining)
+        content = _trim(source.get("content"), limit)
         if content:
-            material.append(
+            entry = (
                 f"SOURCE: {source.get('title')}\n"
                 f"TYPE: {source.get('source_type')}\n"
                 f"URL: {source.get('url')}\n"
                 f"CONTENT:\n{content}"
             )
+            material.append(entry)
+            total_source_chars += len(content)
 
-    for item in web_results[:max_sources]:
-        content = _trim(
-            item.get("extracted_content")
-            or item.get("raw_content")
-            or item.get("content"),
-            8000,
-        )
-        if content:
-            material.append(
-                f"SEARCH RESULT: {item.get('title')}\n"
-                f"URL: {item.get('url')}\n"
-                f"CONTENT:\n{content}"
+    if web_results:
+        per_search_limit = max(1200, search_budget // max(1, min(len(web_results), 4)))
+        total_search_chars = 0
+        for item in web_results[:6]:
+            remaining = search_budget - total_search_chars
+            if remaining <= 300:
+                break
+            limit = min(per_search_limit, remaining)
+            raw = (
+                item.get("extracted_content")
+                or item.get("raw_content")
+                or item.get("content")
             )
+            content = _trim(raw, limit)
+            if content:
+                entry = (
+                    f"SEARCH RESULT: {item.get('title')}\n"
+                    f"URL: {item.get('url')}\n"
+                    f"CONTENT:\n{content}"
+                )
+                material.append(entry)
+                total_search_chars += len(content)
 
     return "\n\n---\n\n".join(material)
 
 
 def research_brief_prompt(topic, sources, web_results):
-    material = _material_from_sources(sources, web_results)
+    material = _material_from_sources(sources, web_results, max_total_chars=30000)
 
     return f"""
 Topic: {topic}
 
-Create a structured, highly comprehensive research brief for a YouTube video script.
+Create a structured, comprehensive research brief for a YouTube video script.
 Return JSON with exactly these keys:
 summary
 key_facts
@@ -455,7 +488,7 @@ content_plan
 `content_plan` must be an array of objects. Each object should contain:
 - title (The name of the announcement, movie, show, item, or topic)
 - angle (The significance, key revelation, or unique storyline)
-- key_facts (2-5 concise, evidence-grounded facts/bullets)
+- key_facts (2-4 concise, evidence-grounded facts/bullets)
 - source_urls (array of supporting URLs)
 
 CRITICAL EXHAUSTIVE COVERAGE INSTRUCTION:
