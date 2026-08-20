@@ -599,7 +599,6 @@ class Worker(QThread):
     stream_token = Signal(str, str)
     finished_ok = Signal(dict)
     failed = Signal(str)
-    scope_check_needed = Signal(dict, int, int)  # brief_dict, current_words, current_minutes
 
     def __init__(self, urls, topic, mode, tavily_key, llama_url, llama_exe, gguf_model, ngl, context, target_words, target_minutes, do_brief, do_youtube, do_doc, check_scope, server_proc_ref, log_callback=None):
         super().__init__()
@@ -963,6 +962,20 @@ class MainWindow(QMainWindow):
 
         right_layout.addLayout(right_header)
 
+        # Real-Time Word & Reading Time Status Bar in Studio Pane
+        self.stats_bar = QWidget()
+        self.stats_bar.setStyleSheet(
+            "QWidget { background-color: #1e1e1e; border: 1px solid #333; border-radius: 6px; padding: 3px 8px; }"
+        )
+        stats_layout = QHBoxLayout(self.stats_bar)
+        stats_layout.setContentsMargins(8, 4, 8, 4)
+
+        self.word_count_lbl = QLabel("📊 <b>YouTube Script:</b> 0 words | <b>Est. Duration:</b> ~0.0 mins (@ 200 wpm) | <b>Characters:</b> 0")
+        self.word_count_lbl.setStyleSheet("font-size: 12px; color: #64b5f6;")
+        stats_layout.addWidget(self.word_count_lbl)
+        stats_layout.addStretch()
+        right_layout.addWidget(self.stats_bar)
+
         self.tabs = QTabWidget()
 
         self.script_b = QPlainTextEdit()
@@ -987,6 +1000,13 @@ class MainWindow(QMainWindow):
 
         right_layout.addWidget(self.tabs)
 
+        # Connect real-time word counter signals
+        self.script_b.textChanged.connect(self.update_word_counts)
+        self.script_a.textChanged.connect(self.update_word_counts)
+        self.research_view.textChanged.connect(self.update_word_counts)
+        self.sources_view.textChanged.connect(self.update_word_counts)
+        self.tabs.currentChanged.connect(self.update_word_counts)
+
         self.splitter.addWidget(left_widget)
         self.splitter.addWidget(self.right_widget)
         self.splitter.setSizes([540, 840])
@@ -999,6 +1019,55 @@ class MainWindow(QMainWindow):
         self.timer.timeout.connect(self.check_server_health)
         self.timer.start()
         self.check_server_health()
+
+    def update_word_counts(self):
+        def count_words(text):
+            if not text:
+                return 0
+            return len(re.findall(r'\b\w+\b', text))
+
+        text_b = self.script_b.toPlainText()
+        text_a = self.script_a.toPlainText()
+        text_r = self.research_view.toPlainText()
+        text_s = self.sources_view.toPlainText()
+
+        words_b = count_words(text_b)
+        words_a = count_words(text_a)
+        words_r = count_words(text_r)
+        words_s = count_words(text_s)
+
+        # Update Tab Title Badges
+        self.tabs.setTabText(0, f"🎬 Version B — YouTube ({words_b:,}w)" if words_b > 0 else "🎬 Version B — YouTube")
+        self.tabs.setTabText(1, f"📽️ Version A — Documentary ({words_a:,}w)" if words_a > 0 else "📽️ Version A — Documentary")
+        self.tabs.setTabText(2, f"📋 Research Brief ({words_r:,}w)" if words_r > 0 else "📋 Research Brief")
+        self.tabs.setTabText(3, f"🔗 Sources & Evidence ({words_s:,}w)" if words_s > 0 else "🔗 Sources & Evidence")
+
+        # Update Header Counter Banner
+        current_idx = self.tabs.currentIndex()
+        if current_idx == 0:
+            mins = round(words_b / 200, 1)
+            self.word_count_lbl.setText(
+                f"📊 <b>YouTube Script:</b> <span style='color:#fff;'><b>{words_b:,}</b> words</span> &nbsp;|&nbsp; "
+                f"<b>Est. Read Time:</b> <span style='color:#81c784;'>~{mins} mins</span> (@ 200 wpm) &nbsp;|&nbsp; "
+                f"<b>Characters:</b> {len(text_b):,}"
+            )
+        elif current_idx == 1:
+            mins = round(words_a / 200, 1)
+            self.word_count_lbl.setText(
+                f"📊 <b>Documentary Script:</b> <span style='color:#fff;'><b>{words_a:,}</b> words</span> &nbsp;|&nbsp; "
+                f"<b>Est. Read Time:</b> <span style='color:#81c784;'>~{mins} mins</span> (@ 200 wpm) &nbsp;|&nbsp; "
+                f"<b>Characters:</b> {len(text_a):,}"
+            )
+        elif current_idx == 2:
+            self.word_count_lbl.setText(
+                f"📊 <b>Research Brief:</b> <span style='color:#fff;'><b>{words_r:,}</b> words</span> &nbsp;|&nbsp; "
+                f"<b>Characters:</b> {len(text_r):,}"
+            )
+        else:
+            self.word_count_lbl.setText(
+                f"📊 <b>Sources & Evidence:</b> <span style='color:#fff;'><b>{words_s:,}</b> words</span> &nbsp;|&nbsp; "
+                f"<b>Characters:</b> {len(text_s):,}"
+            )
 
     def on_duration_combo_changed(self):
         data = self.duration_combo.currentData()
@@ -1367,6 +1436,8 @@ class MainWindow(QMainWindow):
         if sources_text:
             self.sources_view.setPlainText("\n---\n".join(sources_text))
         
+        self.update_word_counts()
+
         now = datetime.now().strftime("%H:%M:%S")
         self.append_log(f"[{now}] [ScriptMaker SUCCESS] Generation tasks finished successfully!")
         

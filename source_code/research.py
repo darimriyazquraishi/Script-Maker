@@ -69,7 +69,7 @@ def choose_caption_url(info):
             for entry in entries:
                 if entry.get("url"):
                     return entry["url"], lang, entry.get("ext", "")
-        # Fallback to any language.
+        # Fallback to any language
         for lang, entries in collection.items():
             for entry in entries:
                 if entry.get("url"):
@@ -77,15 +77,21 @@ def choose_caption_url(info):
     return None, None, None
 
 
-def extract_youtube(url: str) -> Source:
+def extract_youtube(url: str, progress=None) -> Source:
+    if progress:
+        progress(f"[YouTube] Connecting to video: {url}")
+
     try:
         from yt_dlp import YoutubeDL
     except Exception as exc:
+        err_msg = f"yt-dlp unavailable: {exc}"
+        if progress:
+            progress(f"[YouTube ERROR] {err_msg}")
         return Source(
             url=url,
             domain=urlparse(url).netloc,
             source_type="youtube",
-            error=f"yt-dlp unavailable: {exc}",
+            error=err_msg,
         )
 
     source = Source(
@@ -99,55 +105,76 @@ def extract_youtube(url: str) -> Source:
             "quiet": True,
             "skip_download": True,
             "noplaylist": True,
+            "no_warnings": True,
         }
         with YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
 
         source.url = info.get("webpage_url") or url
         source.title = info.get("title") or "YouTube video"
-        source.author = info.get("uploader") or info.get("channel")
+        source.author = info.get("uploader") or info.get("channel") or "Unknown Creator"
         source.published_date = info.get("upload_date")
+        duration_sec = info.get("duration") or 0
+        dur_mins = round(duration_sec / 60, 1) if duration_sec else 0
         description = info.get("description") or ""
+
+        if progress:
+            progress(f"[YouTube] Video Found: '{source.title}' | Creator: '{source.author}' | Duration: ~{dur_mins} mins")
 
         caption_url, caption_lang, caption_ext = choose_caption_url(info)
         transcript = ""
 
         if caption_url:
+            if progress:
+                progress(f"[YouTube] Downloading subtitles & spoken transcript (Language: {caption_lang}, Format: {caption_ext})...")
             try:
                 r = requests.get(caption_url, timeout=20, headers={"User-Agent": USER_AGENT})
                 r.raise_for_status()
                 transcript = extract_vtt_text(r.text)
-            except Exception:
+                word_count = len(re.findall(r'\b\w+\b', transcript))
+                if progress:
+                    progress(f"[YouTube SUCCESS] Extracted {word_count:,} words of spoken video transcript from '{source.title}'!")
+            except Exception as cap_err:
+                if progress:
+                    progress(f"[YouTube WARNING] Could not download caption stream: {cap_err}")
                 transcript = ""
+        else:
+            if progress:
+                progress(f"[YouTube INFO] No closed captions available for '{source.title}'. Using video title and description.")
 
         source.metadata["caption_languages"] = list(
             (info.get("subtitles") or info.get("automatic_captions") or {}).keys()
         )
         source.metadata["caption_language_used"] = caption_lang
-        source.metadata["duration"] = info.get("duration")
-        source.metadata["channel"] = info.get("channel")
+        source.metadata["duration"] = duration_sec
+        source.metadata["channel"] = source.author
         source.metadata["caption_format"] = caption_ext
 
         source.content = (
             f"TITLE: {source.title}\n"
             f"CHANNEL: {source.author or ''}\n"
             f"UPLOAD DATE: {source.published_date or ''}\n"
+            f"DURATION: {dur_mins} mins\n"
             f"DESCRIPTION:\n{description}\n"
         ).strip()
 
         if transcript:
-            source.content += f"\n\nTRANSCRIPT/CAPTIONS:\n{transcript}"
+            source.content += f"\n\nSPOKEN TRANSCRIPT/CAPTIONS:\n{transcript}"
 
         source.excerpt = source.content[:1200]
         source.fetched_ok = True
 
     except Exception as exc:
         source.error = str(exc)
+        if progress:
+            progress(f"[YouTube ERROR] Failed to extract video info: {exc}")
 
     return source
 
 
-def extract_webpage(url: str) -> Source:
+def extract_webpage(url: str, progress=None) -> Source:
+    if progress:
+        progress(f"[Web] Fetching article: {url}")
     parsed = urlparse(url)
     source = Source(
         url=url,
@@ -190,11 +217,19 @@ def extract_webpage(url: str) -> Source:
         source.metadata["http_status"] = response.status_code
         source.metadata["final_url"] = final_url
 
+        word_count = len(re.findall(r'\b\w+\b', source.content))
+        if progress and source.fetched_ok:
+            progress(f"[Web SUCCESS] Extracted {word_count:,} words from '{source.title}'")
+
         if not source.content:
             source.error = "No readable article text was extracted."
+            if progress:
+                progress(f"[Web WARNING] No readable text found at {url}")
 
     except Exception as exc:
         source.error = str(exc)
+        if progress:
+            progress(f"[Web ERROR] Failed to fetch {url}: {exc}")
 
     return source
 
@@ -205,11 +240,11 @@ def collect_sources(urls, progress=None):
 
     for i, url in enumerate(urls, start=1):
         if progress:
-            progress(f"Reading source {i}/{total}: {url}")
+            progress(f"[Source {i}/{total}] Processing: {url}")
         if is_youtube(url):
-            source = extract_youtube(url)
+            source = extract_youtube(url, progress=progress)
         else:
-            source = extract_webpage(url)
+            source = extract_webpage(url, progress=progress)
         sources.append(source)
 
     return sources
@@ -258,127 +293,102 @@ def build_search_queries(topic: str):
         f"{topic} official announcement",
         f"{topic} release date details",
         f"{topic} interview production background",
-        f"{topic} latest update",
     ]
 
 
-def run_expanded_research(topic, mode="free", api_key="", progress=None, max_queries=5):
+def run_expanded_research(topic: str, mode: str = "free", api_key: str = "", progress=None):
+    queries = build_search_queries(topic)
     all_results = []
     errors = []
-    queries = build_search_queries(topic)[:max_queries]
 
-    for idx, query in enumerate(queries, start=1):
-        if mode == "sources":
-            break
-
+    for query in queries:
         if progress:
-            progress(f"Web search {idx}/{len(queries)}: {query}")
+            progress(f"Searching: '{query}'")
 
         if mode == "tavily":
-            results, error = tavily_search(query, api_key)
+            results, err = tavily_search(query, api_key=api_key)
         else:
-            results, error = ddgs_search(query)
+            results, err = ddgs_search(query)
 
-        if error:
-            errors.append(f"{query}: {error}")
-            continue
+        if err:
+            errors.append(f"{query}: {err}")
+        else:
+            for item in results:
+                item["query"] = query
+                all_results.append(item)
 
-        for item in results:
-            url = item.get("href") or item.get("url") or ""
-            all_results.append(
-                {
-                    "query": query,
-                    "title": item.get("title", ""),
-                    "url": url,
-                    "content": item.get("body") or item.get("content") or "",
-                    "raw_content": item.get("raw_content", ""),
-                    "source": item.get("source", ""),
-                }
-            )
-
-    deduped = {}
+    seen = set()
+    deduped = []
     for item in all_results:
-        if item.get("url"):
-            deduped[item["url"]] = item
+        url = item.get("url") or item.get("link")
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        deduped.append(item)
 
-    return list(deduped.values()), errors
+    return deduped, errors
 
 
 def enrich_search_results(results, progress=None, max_pages=6):
     enriched = []
-    seen = set()
+    candidates = results[:max_pages]
+    total = len(candidates)
 
-    candidates = [
-        r for r in results
-        if r.get("url") and r["url"] not in seen
-    ][:max_pages]
-
-    for idx, result in enumerate(candidates, start=1):
-        url = result["url"]
-        seen.add(url)
-
+    for i, item in enumerate(candidates, start=1):
+        url = item.get("url") or item.get("link")
+        if not url:
+            continue
         if progress:
-            progress(f"Reading search result {idx}/{len(candidates)}...")
-
-        source = extract_youtube(url) if is_youtube(url) else extract_webpage(url)
-
-        if source.fetched_ok:
-            enriched.append(
-                {
-                    **result,
-                    "extracted_title": source.title,
-                    "extracted_content": source.content[:12000],
-                    "extracted_ok": True,
-                }
+            progress(f"Reading search result {i}/{total}...")
+        try:
+            r = requests.get(
+                url,
+                timeout=12,
+                headers={"User-Agent": USER_AGENT},
+                allow_redirects=True,
             )
-        else:
-            enriched.append(
-                {
-                    **result,
-                    "extracted_content": "",
-                    "extracted_ok": False,
-                    "extraction_error": source.error,
-                }
-            )
+            r.raise_for_status()
+            text = trafilatura.extract(r.text, include_links=True)
+            if text:
+                item["extracted_content"] = text
+                item["fetched_ok"] = True
+            else:
+                item["fetched_ok"] = False
+        except Exception as exc:
+            item["error"] = str(exc)
+            item["fetched_ok"] = False
+        enriched.append(item)
 
     return enriched
 
 
 def make_evidence_from_sources(sources, web_results):
-    evidence = []
+    evidence_list = []
 
-    for source in sources:
-        if not source.fetched_ok or not source.content:
+    for s in sources:
+        if not s.fetched_ok:
             continue
-
-        evidence.append(
+        evidence_list.append(
             Evidence(
-                claim=f"Source material from {source.title or source.domain}",
-                source_urls=[source.url],
-                supporting_text=[source.content[:5000]],
-                confidence="source_material",
-                source_kind=source.source_type,
+                claim=f"Primary source from {s.domain}: {s.title}",
+                source_url=s.url,
+                source_title=s.title,
+                evidence_text=s.excerpt or s.content[:300],
+                confidence=0.9,
             )
         )
 
-    for result in web_results:
-        content = (
-            result.get("extracted_content")
-            or result.get("raw_content")
-            or result.get("content")
-            or ""
-        )
-        if not content:
+    for r in web_results:
+        if not r.get("fetched_ok"):
             continue
-
-        evidence.append(
+        evidence_list.append(
             Evidence(
-                claim=result.get("title") or "Web research result",
-                source_urls=[result.get("url", "")],
-                supporting_text=[content[:5000]],
-                confidence="web_search",
-                source_kind="search_result",
+                claim=f"Search result for '{r.get('query')}': {r.get('title')}",
+                source_url=r.get("url"),
+                source_title=r.get("title") or "Web Search",
+                evidence_text=(r.get("extracted_content") or r.get("body") or "")[:300],
+                confidence=0.75,
             )
         )
 
-    return evidence
+    return evidence_list
