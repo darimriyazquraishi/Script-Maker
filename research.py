@@ -371,10 +371,10 @@ def make_evidence_from_sources(sources, web_results):
         evidence_list.append(
             Evidence(
                 claim=f"Primary source from {s.domain}: {s.title}",
-                source_url=s.url,
-                source_title=s.title,
-                evidence_text=s.excerpt or s.content[:300],
-                confidence=0.9,
+                source_urls=[s.url] if s.url else [],
+                supporting_text=[s.excerpt or s.content[:300]],
+                confidence="high",
+                source_kind=s.source_type,
             )
         )
 
@@ -384,10 +384,10 @@ def make_evidence_from_sources(sources, web_results):
         evidence_list.append(
             Evidence(
                 claim=f"Search result for '{r.get('query')}': {r.get('title')}",
-                source_url=r.get("url"),
-                source_title=r.get("title") or "Web Search",
-                evidence_text=(r.get("extracted_content") or r.get("body") or "")[:300],
-                confidence=0.75,
+                source_urls=[r.get("url")] if r.get("url") else [],
+                supporting_text=[(r.get("extracted_content") or r.get("body") or "")[:300]],
+                confidence="medium",
+                source_kind="web",
             )
         )
 

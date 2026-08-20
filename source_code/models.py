@@ -25,8 +25,17 @@ class Evidence:
     claim: str
     source_urls: List[str] = field(default_factory=list)
     supporting_text: List[str] = field(default_factory=list)
-    confidence: str = "unknown"
+    confidence: Any = "high"
     source_kind: str = "web"
+    source_url: Optional[str] = None
+    source_title: Optional[str] = None
+    evidence_text: Optional[str] = None
+
+    def __post_init__(self):
+        if self.source_url and not self.source_urls:
+            self.source_urls = [self.source_url]
+        if self.evidence_text and not self.supporting_text:
+            self.supporting_text = [self.evidence_text]
 
     def to_dict(self):
         return asdict(self)
